@@ -1167,3 +1167,43 @@ class TestLocalFileTransfer:
             assert ws_url == "ws://target"
         finally:
             session._ACTIVE_NOTEBOOK_URL = None
+
+    @pytest.mark.asyncio
+    async def test_read_cell_outputs_defaults_to_latest_20_lines(self, mock_proxy_client):
+        tool = management_tool(mock_proxy_client, "read_cell_outputs")
+        fifty_lines = "\n".join(f"line {i}" for i in range(50)) + "\n"
+        tool._call_colab = AsyncMock(
+            return_value=tool_result(
+                {
+                    "cells": [
+                        {
+                            "id": "c1",
+                            "outputs": [{"output_type": "stream", "text": fifty_lines}],
+                        }
+                    ]
+                }
+            )
+        )
+
+        # 1. 默认调用：只保留最新 20 行
+        result = await tool.run({"cellIds": ["c1"]})
+        assert result.structured_content["totalLines"]["c1"] == 50
+        assert result.structured_content["returnedLines"]["c1"] == 20
+        tail_text = result.structured_content["tailText"]["c1"]
+        assert "line 49" in tail_text
+        assert "line 30" in tail_text
+        assert "line 29" not in tail_text
+        assert len(tail_text.splitlines()) == 20
+
+        # 2. 自定义 lines=5
+        result_5 = await tool.run({"cellIds": ["c1"], "lines": 5})
+        assert result_5.structured_content["returnedLines"]["c1"] == 5
+        tail_5 = result_5.structured_content["tailText"]["c1"]
+        assert "line 45" in tail_5
+        assert "line 44" not in tail_5
+        assert len(tail_5.splitlines()) == 5
+
+        # 3. 指定 lines=0 返回全部行
+        result_all = await tool.run({"cellIds": ["c1"], "lines": 0})
+        assert result_all.structured_content["returnedLines"]["c1"] == 50
+        assert "line 0" in result_all.structured_content["tailText"]["c1"]

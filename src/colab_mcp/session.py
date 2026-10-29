@@ -673,11 +673,16 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
         },
     },
     "read_cell_outputs": {
-        "description": "Returns outputs for selected cells.",
+        "description": "Returns outputs for selected cells, tailing the latest lines (default: 20) to prevent oversized logs.",
         "parameters": {
             "type": "object",
             "properties": {
                 "cellIds": {"type": "array", "items": {"type": "string"}},
+                "lines": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "Number of latest lines of output to return per cell. Defaults to 20. Pass <= 0 to return all lines.",
+                },
                 "maxBytes": {"type": "integer", "minimum": 1, "default": 20000},
                 "normalize": {"type": "boolean", "default": True},
             },
@@ -691,6 +696,11 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
             "type": "object",
             "properties": {
                 "cellIds": {"type": "array", "items": {"type": "string"}},
+                "lines": {
+                    "type": "integer",
+                    "default": 20,
+                    "description": "Number of latest lines of output to return per cell. Defaults to 20. Pass <= 0 to return all lines.",
+                },
                 "timeoutSeconds": {"type": "number", "minimum": 0, "default": 10},
                 "pollIntervalSeconds": {
                     "type": "number",
@@ -1230,6 +1240,117 @@ class ColabRuntimeManagementTool(Tool):
                 chunk["text"] = "".join(text) if isinstance(text, list) else str(text)
             chunks.append(chunk)
         return chunks
+
+    @staticmethod
+    def _tail_chunks_and_text(
+        chunks: list[dict], lines: int | None
+    ) -> tuple[list[dict], str, int]:
+        """
+        Tails chunks so that total lines across all chunks is at most `lines`.
+        Returns (tailed_chunks, joined_tail_text, total_lines_before_tail).
+        """
+        all_chunk_lines = [
+            chunk.get("text", "").splitlines() for chunk in chunks
+        ]
+        total_lines = sum(len(cl) for cl in all_chunk_lines)
+        if lines is None or lines <= 0 or total_lines <= lines:
+            joined = "\n".join(
+                line for cl in all_chunk_lines for line in cl
+            )
+            return chunks, joined, total_lines
+
+        remaining = lines
+        tailed = []
+        for chunk, cl in zip(reversed(chunks), reversed(all_chunk_lines)):
+            if remaining <= 0:
+                break
+            if len(cl) <= remaining:
+                tailed.append(chunk)
+                remaining -= len(cl)
+            else:
+                tailed_cl = cl[-remaining:]
+                new_chunk = dict(chunk)
+                new_chunk["text"] = "\n".join(tailed_cl)
+                tailed.append(new_chunk)
+                remaining = 0
+                break
+
+        tailed.reverse()
+        joined = "\n".join(
+            line
+            for chunk in tailed
+            for line in chunk.get("text", "").splitlines()
+        )
+        return tailed, joined, total_lines
+
+    @staticmethod
+    def _tail_raw_outputs(outputs: list[dict], lines: int | None) -> list[dict]:
+        """
+        Tails raw jupyter outputs to keep at most `lines` lines across all outputs.
+        """
+        if not outputs or lines is None or lines <= 0:
+            return outputs
+
+        def get_lines(op):
+            if "text" in op:
+                t = op["text"]
+                return t if isinstance(t, list) else str(t).splitlines(keepends=True)
+            if op.get("output_type") == "error":
+                tb = op.get("traceback") or []
+                if tb:
+                    return tb
+                return [str(op.get("evalue", "")) + "\n"]
+            if (
+                "data" in op
+                and isinstance(op["data"], dict)
+                and "text/plain" in op["data"]
+            ):
+                tp = op["data"]["text/plain"]
+                return tp if isinstance(tp, list) else str(tp).splitlines(keepends=True)
+            return ["\n"]
+
+        op_lines = [get_lines(op) for op in outputs]
+        total = sum(len(l) for l in op_lines)
+        if total <= lines:
+            return outputs
+
+        remaining = lines
+        tailed = []
+        for op, l in zip(reversed(outputs), reversed(op_lines)):
+            if remaining <= 0:
+                break
+            if len(l) <= remaining:
+                tailed.append(op)
+                remaining -= len(l)
+            else:
+                new_op = dict(op)
+                tailed_l = l[-remaining:]
+                if "text" in new_op:
+                    new_op["text"] = (
+                        "".join(tailed_l)
+                        if isinstance(new_op["text"], str)
+                        else tailed_l
+                    )
+                elif new_op.get("output_type") == "error":
+                    new_op["traceback"] = tailed_l
+                elif (
+                    "data" in new_op
+                    and isinstance(new_op["data"], dict)
+                    and "text/plain" in new_op["data"]
+                ):
+                    new_data = dict(new_op["data"])
+                    new_data["text/plain"] = (
+                        "".join(tailed_l)
+                        if isinstance(new_data["text/plain"], str)
+                        else tailed_l
+                    )
+                    new_op["data"] = new_data
+                tailed.append(new_op)
+                remaining = 0
+                break
+
+        tailed.reverse()
+        return tailed
 
     @staticmethod
     def _notebook_document(cells: list[dict], *, name: str | None = None) -> dict:
@@ -2019,18 +2140,41 @@ class ColabRuntimeManagementTool(Tool):
                 )
             max_bytes = int(arguments.get("maxBytes", 20000))
             normalize = bool(arguments.get("normalize", True))
-            outputs = {
+            lines_arg = arguments.get("lines", 20)
+            lines = int(lines_arg) if lines_arg is not None else 20
+            raw_outputs = {
                 cell_id: by_id[cell_id][1].get("outputs", [])
                 for cell_id in cell_ids
                 if cell_id in by_id
             }
-            normalized = {
-                cell_id: self._normalize_outputs(cell_outputs)
-                for cell_id, cell_outputs in outputs.items()
+
+            tailed_outputs = {}
+            tailed_chunks = {}
+            tail_texts = {}
+            total_lines_map = {}
+            returned_lines_map = {}
+
+            for cell_id, cell_outputs in raw_outputs.items():
+                norm_chunks = self._normalize_outputs(cell_outputs)
+                chunks_tailed, tail_text, total_lines = self._tail_chunks_and_text(
+                    norm_chunks, lines
+                )
+                tailed_chunks[cell_id] = chunks_tailed
+                tail_texts[cell_id] = tail_text
+                total_lines_map[cell_id] = total_lines
+                returned_lines_map[cell_id] = (
+                    len(tail_text.splitlines()) if tail_text else 0
+                )
+                tailed_outputs[cell_id] = self._tail_raw_outputs(cell_outputs, lines)
+
+            payload = {
+                "outputs": tailed_outputs,
+                "tailText": tail_texts,
+                "totalLines": total_lines_map,
+                "returnedLines": returned_lines_map,
             }
-            payload = {"outputs": outputs}
             if normalize:
-                payload["chunks"] = normalized
+                payload["chunks"] = tailed_chunks
             text = json.dumps(payload, ensure_ascii=False, indent=2)
             truncated = len(text.encode("utf-8")) > max_bytes
             if truncated:
@@ -2040,8 +2184,11 @@ class ColabRuntimeManagementTool(Tool):
             return ToolResult(
                 content=[TextContent(type="text", text=text)],
                 structured_content={
-                    "outputs": outputs,
-                    "chunks": normalized if normalize else None,
+                    "outputs": tailed_outputs,
+                    "chunks": tailed_chunks if normalize else None,
+                    "tailText": tail_texts,
+                    "totalLines": total_lines_map,
+                    "returnedLines": returned_lines_map,
                     "truncated": truncated,
                 },
             )
