@@ -179,6 +179,70 @@ class TestCheckSessionProxyToolFn:
         assert "mcpProxyToken=test-token" in args[0]
         assert "mcpProxyPort=1234" in args[0]
 
+    @pytest.mark.asyncio
+    async def test_disconnected_with_custom_url(self, mock_browser_navigation):
+        ctx = Mock()
+
+        def get_state(k):
+            if k == session.FE_CONNECTED_KEY:
+                return False
+            if k == session.PROXY_TOKEN_KEY:
+                return "test-token"
+            if k == session.PROXY_PORT_KEY:
+                return 1234
+            return None
+
+        ctx.get_state.side_effect = get_state
+        custom_url = "https://colab.research.google.com/drive/1ABCDEFG"
+        assert (
+            await session.check_session_proxy_tool_fn(ctx=ctx, notebook_url=custom_url)
+            is False
+        )
+        mock_browser_navigation.assert_called_once()
+        args, _ = mock_browser_navigation.call_args
+        assert args[0] == f"{custom_url}#mcpProxyToken=test-token&mcpProxyPort=1234"
+
+    @pytest.mark.asyncio
+    async def test_disconnected_with_hash_url(self, mock_browser_navigation):
+        ctx = Mock()
+
+        def get_state(k):
+            if k == session.FE_CONNECTED_KEY:
+                return False
+            if k == session.PROXY_TOKEN_KEY:
+                return "test-token"
+            if k == session.PROXY_PORT_KEY:
+                return 1234
+            return None
+
+        ctx.get_state.side_effect = get_state
+        url_with_hash = "https://colab.research.google.com/drive/1ABCDEFG#scrollTo=123"
+        assert (
+            await session.check_session_proxy_tool_fn(
+                ctx=ctx, notebook_url=url_with_hash
+            )
+            is False
+        )
+        mock_browser_navigation.assert_called_once()
+        args, _ = mock_browser_navigation.call_args
+        assert (
+            args[0]
+            == "https://colab.research.google.com/drive/1ABCDEFG#mcpProxyToken=test-token&mcpProxyPort=1234"
+        )
+
+
+def test_resolve_notebook_url():
+    session._ACTIVE_NOTEBOOK_URL = None
+    assert (
+        session.resolve_notebook_url(None) == f"{session.COLAB}{session.SCRATCH_PATH}"
+    )
+    assert session.resolve_notebook_url("") == f"{session.COLAB}{session.SCRATCH_PATH}"
+    assert (
+        session.resolve_notebook_url("https://colab.research.google.com/drive/123#hash")
+        == "https://colab.research.google.com/drive/123"
+    )
+    assert session.resolve_notebook_url("/drive/123") == f"{session.COLAB}/drive/123"
+
 
 class TestControlledEdgeLaunch:
     def test_ensure_controlled_edge_reuses_live_cdp(self, monkeypatch):
@@ -200,7 +264,9 @@ class TestControlledEdgeLaunch:
         monkeypatch.setattr(
             session, "_cdp_alive", Mock(side_effect=lambda _port: next(alive_results))
         )
-        monkeypatch.setattr(session, "_edge_executable_path", Mock(return_value=str(edge_path)))
+        monkeypatch.setattr(
+            session, "_edge_executable_path", Mock(return_value=str(edge_path))
+        )
         monkeypatch.setattr(session.subprocess, "Popen", popen)
         monkeypatch.setattr(session.time, "sleep", Mock())
 
@@ -348,7 +414,10 @@ class TestColabSessionProxy:
 
         assert "releases/unassigns" in shutdown_tool.description
         assert "final cleanup step" in shutdown_tool.description
-        assert "Download needed weights, logs, and artifacts first" in shutdown_tool.description
+        assert (
+            "Download needed weights, logs, and artifacts first"
+            in shutdown_tool.description
+        )
         assert "does not uninstall the MCP server" in shutdown_tool.description
         assert "does not close the browser tab" in shutdown_tool.description
 
@@ -631,11 +700,91 @@ class TestManagementToolLogic:
             await tool.run({"cellId": "a"})
 
     @pytest.mark.asyncio
+    async def test_patch_cell_target_replacement(self, mock_proxy_client):
+        tool = management_tool(mock_proxy_client, "patch_cell")
+        tool._call_colab = AsyncMock(
+            side_effect=[
+                tool_result({"cells": [{"id": "c1", "source": "x = 10\ny = 20\n"}]}),
+                tool_result({"cellId": "c1", "updated": True}),
+            ]
+        )
+
+        result = await tool.run(
+            {
+                "cellId": "c1",
+                "target": "x = 10",
+                "replacement": "x = 99",
+            }
+        )
+
+        assert tool._call_colab.await_count == 2
+        assert tool._call_colab.await_args_list[0].args == (
+            "get_cells",
+            {"includeOutputs": False},
+        )
+        assert tool._call_colab.await_args_list[1].args == (
+            "update_cell",
+            {"cellId": "c1", "content": "x = 99\ny = 20\n"},
+        )
+        assert result.structured_content["patched"] is True
+        assert result.structured_content["replacedCount"] == 1
+
+    @pytest.mark.asyncio
+    async def test_patch_cell_target_with_count(self, mock_proxy_client):
+        tool = management_tool(mock_proxy_client, "patch_cell")
+        tool._call_colab = AsyncMock(
+            side_effect=[
+                tool_result({"cells": [{"id": "c1", "source": "foo foo foo"}]}),
+                tool_result({"cellId": "c1", "updated": True}),
+            ]
+        )
+
+        result = await tool.run(
+            {
+                "cellId": "c1",
+                "target": "foo",
+                "replacement": "bar",
+                "count": 1,
+            }
+        )
+
+        assert tool._call_colab.await_args_list[1].args == (
+            "update_cell",
+            {"cellId": "c1", "content": "bar foo foo"},
+        )
+        assert result.structured_content["replacedCount"] == 1
+        assert result.structured_content["occurrences"] == 3
+
+    @pytest.mark.asyncio
+    async def test_patch_cell_target_not_found(self, mock_proxy_client):
+        tool = management_tool(mock_proxy_client, "patch_cell")
+        tool._call_colab = AsyncMock(
+            return_value=tool_result({"cells": [{"id": "c1", "source": "x = 1"}]})
+        )
+
+        with pytest.raises(ValueError, match="Target text not found"):
+            await tool.run({"cellId": "c1", "target": "y = 2"})
+
+    @pytest.mark.asyncio
+    async def test_patch_cell_cell_not_found(self, mock_proxy_client):
+        tool = management_tool(mock_proxy_client, "patch_cell")
+        tool._call_colab = AsyncMock(
+            return_value=tool_result({"cells": [{"id": "c1", "source": "x = 1"}]})
+        )
+
+        with pytest.raises(ValueError, match="Cell not found"):
+            await tool.run({"cellId": "c2", "target": "x = 1"})
+
+    @pytest.mark.asyncio
     async def test_shell_tools_generate_runtime_scripts(self, mock_proxy_client):
         run_shell = management_tool(mock_proxy_client, "run_shell_command")
         run_shell._run_terminal_python = AsyncMock(return_value={})
         await run_shell.run(
-            {"command": "pwd && echo out && echo err >&2", "timeoutSeconds": 7, "cwd": "/content/work"}
+            {
+                "command": "pwd && echo out && echo err >&2",
+                "timeoutSeconds": 7,
+                "cwd": "/content/work",
+            }
         )
         code = run_shell._run_terminal_python.await_args.args[0]
         assert "timeout=timeout_seconds" in code
@@ -648,7 +797,9 @@ class TestManagementToolLogic:
 
         start = management_tool(mock_proxy_client, "start_background_command")
         start._run_terminal_python = AsyncMock(return_value={})
-        await start.run({"command": "python train.py", "name": "train", "cwd": "/content/work"})
+        await start.run(
+            {"command": "python train.py", "name": "train", "cwd": "/content/work"}
+        )
         code = start._run_terminal_python.await_args.args[0]
         assert "subprocess.Popen" in code
         assert "registry[name]" in code
@@ -690,7 +841,10 @@ class TestManagementToolLogic:
     @pytest.mark.asyncio
     async def test_file_tools_use_runtime_contents_api(self, mock_proxy_client):
         upload = management_tool(mock_proxy_client, "upload_file")
-        with patch("colab_mcp.session._runtime_upload_file", return_value={"path": "/content/数据/hello.txt"}):
+        with patch(
+            "colab_mcp.session._runtime_upload_file",
+            return_value={"path": "/content/数据/hello.txt"},
+        ):
             result = await upload.run(
                 {
                     "path": "/content/数据/hello.txt",
@@ -702,7 +856,10 @@ class TestManagementToolLogic:
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         upload_local = management_tool(mock_proxy_client, "upload_local_file")
-        with patch("colab_mcp.session._runtime_upload_local_file", return_value={"localPath": "C:/tmp/in.txt", "path": "/content/in.txt"}):
+        with patch(
+            "colab_mcp.session._runtime_upload_local_file",
+            return_value={"localPath": "C:/tmp/in.txt", "path": "/content/in.txt"},
+        ):
             result = await upload_local.run(
                 {
                     "localPath": "C:/tmp/in.txt",
@@ -714,12 +871,20 @@ class TestManagementToolLogic:
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         download = management_tool(mock_proxy_client, "download_file")
-        with patch("colab_mcp.session._runtime_download_file", return_value={"contentBase64": "5L2g5aW9"}):
-            result = await download.run({"path": "/content/数据/hello.txt", "offset": 2, "maxBytes": 8})
+        with patch(
+            "colab_mcp.session._runtime_download_file",
+            return_value={"contentBase64": "5L2g5aW9"},
+        ):
+            result = await download.run(
+                {"path": "/content/数据/hello.txt", "offset": 2, "maxBytes": 8}
+            )
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         download_local = management_tool(mock_proxy_client, "download_file_to_local")
-        with patch("colab_mcp.session._runtime_download_file_to_local", return_value={"localPath": "C:/tmp/out.txt", "path": "/content/out.txt"}):
+        with patch(
+            "colab_mcp.session._runtime_download_file_to_local",
+            return_value={"localPath": "C:/tmp/out.txt", "path": "/content/out.txt"},
+        ):
             result = await download_local.run(
                 {
                     "path": "/content/out.txt",
@@ -731,7 +896,10 @@ class TestManagementToolLogic:
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         chunk = management_tool(mock_proxy_client, "upload_file_chunk")
-        with patch("colab_mcp.session._runtime_upload_file_chunk", return_value={"chunkBytes": 3}):
+        with patch(
+            "colab_mcp.session._runtime_upload_file_chunk",
+            return_value={"chunkBytes": 3},
+        ):
             result = await chunk.run(
                 {
                     "uploadId": "run/1",
@@ -744,38 +912,64 @@ class TestManagementToolLogic:
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         complete = management_tool(mock_proxy_client, "complete_upload")
-        with patch("colab_mcp.session._runtime_complete_upload", return_value={"size": 3}):
-            result = await complete.run({"uploadId": "run/1", "path": "/content/out.bin", "overwrite": True})
+        with patch(
+            "colab_mcp.session._runtime_complete_upload", return_value={"size": 3}
+        ):
+            result = await complete.run(
+                {"uploadId": "run/1", "path": "/content/out.bin", "overwrite": True}
+            )
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         download_chunk = management_tool(mock_proxy_client, "download_file_chunk")
-        with patch("colab_mcp.session._runtime_download_file_chunk", return_value={"done": False}):
-            result = await download_chunk.run({"path": "/content/out.bin", "offset": 4, "maxBytes": 16})
+        with patch(
+            "colab_mcp.session._runtime_download_file_chunk",
+            return_value={"done": False},
+        ):
+            result = await download_chunk.run(
+                {"path": "/content/out.bin", "offset": 4, "maxBytes": 16}
+            )
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         stat_file = management_tool(mock_proxy_client, "stat_file")
-        with patch("colab_mcp.session._runtime_stat_file", return_value={"exists": True}):
+        with patch(
+            "colab_mcp.session._runtime_stat_file", return_value={"exists": True}
+        ):
             result = await stat_file.run({"path": "/content/out.bin"})
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         list_files = management_tool(mock_proxy_client, "list_files")
-        with patch("colab_mcp.session._runtime_list_files", return_value={"entries": []}):
-            result = await list_files.run({"path": "/content/数据", "recursive": True, "maxEntries": 2})
+        with patch(
+            "colab_mcp.session._runtime_list_files", return_value={"entries": []}
+        ):
+            result = await list_files.run(
+                {"path": "/content/数据", "recursive": True, "maxEntries": 2}
+            )
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         delete = management_tool(mock_proxy_client, "delete_file")
-        with patch("colab_mcp.session._runtime_delete_file", return_value={"deleted": True}):
+        with patch(
+            "colab_mcp.session._runtime_delete_file", return_value={"deleted": True}
+        ):
             result = await delete.run({"path": "/content/out.bin", "recursive": False})
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         mkdir = management_tool(mock_proxy_client, "make_directory")
-        with patch("colab_mcp.session._runtime_make_directory", return_value={"created": True}):
-            result = await mkdir.run({"path": "/content/数据/new", "parents": True, "existOk": True})
+        with patch(
+            "colab_mcp.session._runtime_make_directory", return_value={"created": True}
+        ):
+            result = await mkdir.run(
+                {"path": "/content/数据/new", "parents": True, "existOk": True}
+            )
         assert result.structured_content["executionBackend"] == "colab-file-api"
 
         upload._run_terminal_python = AsyncMock(return_value={})
-        with patch("colab_mcp.session._runtime_upload_file", return_value={"path": "/content/out.bin"}):
-            await upload.run({"path": "/content/out.bin", "contentBase64": "AA==", "overwrite": True})
+        with patch(
+            "colab_mcp.session._runtime_upload_file",
+            return_value={"path": "/content/out.bin"},
+        ):
+            await upload.run(
+                {"path": "/content/out.bin", "contentBase64": "AA==", "overwrite": True}
+            )
         upload._run_terminal_python.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -788,7 +982,7 @@ class TestManagementToolLogic:
             }
         )
         with (
-            patch("colab_mcp.session._navigate_controlled_edge", return_value=True),
+            patch("colab_mcp.session._navigate_controlled_edge") as mock_nav,
             patch(
                 "colab_mcp.session._evaluate_colab_page",
                 return_value={
@@ -800,6 +994,7 @@ class TestManagementToolLogic:
         ):
             result = await tool.run({})
 
+        mock_nav.assert_not_called()
         assert result.structured_content["python"] == "3.13"
         assert result.structured_content["acceleratorUiState"]["hasGpuHint"] is True
 
@@ -815,13 +1010,19 @@ class TestManagementToolLogic:
             }
         )
         with patch(
-            "colab_mcp.session._navigate_controlled_edge",
+            "colab_mcp.session._evaluate_colab_page",
             side_effect=RuntimeError("browser unavailable"),
-        ):
+        ), patch(
+            "colab_mcp.session._navigate_controlled_edge"
+        ) as mock_nav:
             result = await tool.run({})
 
+        mock_nav.assert_not_called()
         assert result.structured_content["status"] == "warning"
-        assert "Could not inspect accelerator UI state" in result.structured_content["warnings"][0]
+        assert (
+            "Could not inspect accelerator UI state"
+            in result.structured_content["warnings"][0]
+        )
 
     def test_terminal_tool_result_marks_warnings(self, mock_proxy_client):
         tool = management_tool(mock_proxy_client, "check_gpu")
@@ -861,7 +1062,9 @@ class TestManagementToolLogic:
         assert result.structured_content["status"] == "error"
         assert result.structured_content["warnings"] == ["runtime disconnected"]
 
-    def test_terminal_tool_result_marks_nonzero_returncode_error(self, mock_proxy_client):
+    def test_terminal_tool_result_marks_nonzero_returncode_error(
+        self, mock_proxy_client
+    ):
         tool = management_tool(mock_proxy_client, "run_shell_command")
         result = tool._terminal_tool_result(
             {
@@ -926,4 +1129,41 @@ class TestLocalFileTransfer:
         with pytest.raises(ValueError, match="Local path is required"):
             session._runtime_upload_local_file("", "/content/out.txt")
 
+    @pytest.mark.asyncio
+    async def test_connect_runtime_does_not_navigate_when_connected(self, mock_proxy_client):
+        tool = management_tool(mock_proxy_client, "connect_runtime")
+        mock_proxy_client.is_connected.return_value = True
+        with (
+            patch("colab_mcp.session._navigate_controlled_edge") as mock_nav,
+            patch(
+                "colab_mcp.session._evaluate_colab_page",
+                return_value={"result": {"value": '{"ok": true}'}},
+            ),
+        ):
+            result = await tool.run({})
 
+        mock_nav.assert_not_called()
+        assert result.structured_content["ok"] is True
+
+    def test_colab_page_websocket_url_prefers_drive_tab(self, monkeypatch):
+        tabs = [
+            {"type": "page", "url": "https://colab.research.google.com/notebooks/empty.ipynb", "webSocketDebuggerUrl": "ws://empty"},
+            {"type": "page", "url": "https://colab.research.google.com/drive/1QYf0txvcL0EA", "webSocketDebuggerUrl": "ws://drive"},
+        ]
+        monkeypatch.setattr(session, "_cdp_json", Mock(return_value=tabs))
+        session._ACTIVE_NOTEBOOK_URL = None
+        ws_url = session._colab_page_websocket_url()
+        assert ws_url == "ws://drive"
+
+    def test_colab_page_websocket_url_prefers_active_notebook(self, monkeypatch):
+        tabs = [
+            {"type": "page", "url": "https://colab.research.google.com/drive/OTHER", "webSocketDebuggerUrl": "ws://other"},
+            {"type": "page", "url": "https://colab.research.google.com/drive/TARGET_123", "webSocketDebuggerUrl": "ws://target"},
+        ]
+        monkeypatch.setattr(session, "_cdp_json", Mock(return_value=tabs))
+        session.set_active_notebook_url("https://colab.research.google.com/drive/TARGET_123")
+        try:
+            ws_url = session._colab_page_websocket_url()
+            assert ws_url == "ws://target"
+        finally:
+            session._ACTIVE_NOTEBOOK_URL = None

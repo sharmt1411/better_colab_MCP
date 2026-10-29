@@ -624,13 +624,16 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
         },
     },
     "patch_cell": {
-        "description": "Partially updates a cell. Currently supports source/content updates.",
+        "description": "Partially updates a cell via search-and-replace (target and replacement) or full source/content overwrite.",
         "parameters": {
             "type": "object",
             "properties": {
-                "cellId": {"type": "string"},
-                "source": {"type": "string"},
-                "content": {"type": "string"},
+                "cellId": {"type": "string", "description": "The ID of the cell to update."},
+                "target": {"type": "string", "description": "The exact string to find and replace in the cell."},
+                "replacement": {"type": "string", "description": "The string to replace the target with (defaults to empty string)."},
+                "count": {"type": "integer", "description": "Number of occurrences to replace. Defaults to -1 (replace all)."},
+                "source": {"type": "string", "description": "Full cell source content (for backward compatibility)."},
+                "content": {"type": "string", "description": "Full cell content (alias for source)."},
             },
             "required": ["cellId"],
             "additionalProperties": False,
@@ -659,7 +662,11 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
                     "default": ["success", "error"],
                 },
                 "timeoutSeconds": {"type": "number", "minimum": 0, "default": 60},
-                "pollIntervalSeconds": {"type": "number", "minimum": 0.1, "default": 0.5},
+                "pollIntervalSeconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "default": 0.5,
+                },
             },
             "required": ["cellIds"],
             "additionalProperties": False,
@@ -685,7 +692,11 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
             "properties": {
                 "cellIds": {"type": "array", "items": {"type": "string"}},
                 "timeoutSeconds": {"type": "number", "minimum": 0, "default": 10},
-                "pollIntervalSeconds": {"type": "number", "minimum": 0.1, "default": 0.5},
+                "pollIntervalSeconds": {
+                    "type": "number",
+                    "minimum": 0.1,
+                    "default": 0.5,
+                },
                 "maxBytes": {"type": "integer", "minimum": 1, "default": 20000},
                 "normalize": {"type": "boolean", "default": True},
             },
@@ -1071,7 +1082,9 @@ class StaticColabProxyTool(Tool):
             warnings = [*warnings, structured_content["warning"]]
         if structured_content.get("error") and not warnings:
             warnings = [str(structured_content["error"])]
-        failed = structured_content.get("ok") is False or bool(structured_content.get("error"))
+        failed = structured_content.get("ok") is False or bool(
+            structured_content.get("error")
+        )
         status = "warning" if warnings or failed else "ok"
         return ToolResult(
             content=result.content,
@@ -1182,7 +1195,9 @@ class ColabRuntimeManagementTool(Tool):
         return redacted
 
     @staticmethod
-    def _normalize_outputs(outputs: list[dict], *, observed_at: float | None = None) -> list[dict]:
+    def _normalize_outputs(
+        outputs: list[dict], *, observed_at: float | None = None
+    ) -> list[dict]:
         import time
 
         timestamp = observed_at if observed_at is not None else time.time()
@@ -1206,7 +1221,9 @@ class ColabRuntimeManagementTool(Tool):
                 chunk["text"] = "".join(text) if isinstance(text, list) else str(text)
             elif output_type == "error":
                 traceback = output.get("traceback") or []
-                chunk["text"] = "\n".join(traceback) if traceback else str(output.get("evalue", ""))
+                chunk["text"] = (
+                    "\n".join(traceback) if traceback else str(output.get("evalue", ""))
+                )
             elif "data" in output:
                 data = output.get("data") or {}
                 text = data.get("text/plain", "")
@@ -1249,7 +1266,9 @@ class ColabRuntimeManagementTool(Tool):
         if content:
             result.update(content)
         result.update(extra)
-        final_warnings = list(warnings if warnings is not None else result.get("warnings") or [])
+        final_warnings = list(
+            warnings if warnings is not None else result.get("warnings") or []
+        )
         if result.get("warning"):
             final_warnings.append(str(result["warning"]))
         if result.get("error") and not final_warnings:
@@ -1343,9 +1362,7 @@ class ColabRuntimeManagementTool(Tool):
             chunks_by_index = {}
             for index, chunk in chunk_matches:
                 chunks_by_index[int(index)] = chunk
-            payload = "".join(
-                chunk for _, chunk in sorted(chunks_by_index.items())
-            )
+            payload = "".join(chunk for _, chunk in sorted(chunks_by_index.items()))
             result = json.loads(base64.b64decode(payload).decode("utf-8"))
             result.setdefault("executionBackend", "colab-terminal")
             return result
@@ -1372,15 +1389,14 @@ class ColabRuntimeManagementTool(Tool):
             "import os\n"
             "os.makedirs('/content/.colab_mcp_results', exist_ok=True)\n"
             f"os.environ['COLAB_MCP_RESULT_MARKER'] = {marker!r}\n"
-            f"os.environ['COLAB_MCP_RESULT_PATH'] = {result_path!r}\n"
-            + code
+            f"os.environ['COLAB_MCP_RESULT_PATH'] = {result_path!r}\n" + code
         )
         encoded_code = base64.b64encode(code.encode("utf-8")).decode("ascii")
         command = (
             "python3 -c "
             + "'import base64;exec(base64.b64decode(\""
             + encoded_code
-            + "\").decode(\"utf-8\"))'"
+            + '").decode("utf-8"))\''
         )
         return await self._run_terminal_command(
             command,
@@ -1454,7 +1470,9 @@ class ColabRuntimeManagementTool(Tool):
                 isinstance(key, str) and isinstance(value, str)
                 for key, value in variables.items()
             ):
-                raise ValueError("variables must be an object of string keys and values")
+                raise ValueError(
+                    "variables must be an object of string keys and values"
+                )
 
             persist = bool(arguments.get("persist", False))
             marker_name = arguments.get("markerName") or "default"
@@ -1491,7 +1509,9 @@ class ColabRuntimeManagementTool(Tool):
         if self.name == "rerun_env_setup_cells":
             marker_name = arguments.get("markerName")
             include_outputs = bool(arguments.get("includeOutputs", True))
-            cells_result = await self._call_colab("get_cells", {"includeOutputs": False})
+            cells_result = await self._call_colab(
+                "get_cells", {"includeOutputs": False}
+            )
             cells = json.loads(self._result_text(cells_result))["cells"]
             matched = []
             for cell in cells:
@@ -1499,7 +1519,9 @@ class ColabRuntimeManagementTool(Tool):
                 if not source.startswith(ENV_SETUP_MARKER_PREFIX):
                     continue
                 first_line = source.splitlines()[0].strip()
-                current_marker = first_line.removeprefix(ENV_SETUP_MARKER_PREFIX).strip()
+                current_marker = first_line.removeprefix(
+                    ENV_SETUP_MARKER_PREFIX
+                ).strip()
                 if marker_name and current_marker != marker_name:
                     continue
                 matched.append((cell["id"], current_marker))
@@ -1653,7 +1675,9 @@ class ColabRuntimeManagementTool(Tool):
                 try:
                     call = self._call_colab("run_code_cell", {"cellId": cell_id})
                     if timeout_seconds is not None:
-                        result = await asyncio.wait_for(call, timeout=float(timeout_seconds))
+                        result = await asyncio.wait_for(
+                            call, timeout=float(timeout_seconds)
+                        )
                     else:
                         result = await call
                     payload = json.loads(self._result_text(result))
@@ -1666,7 +1690,11 @@ class ColabRuntimeManagementTool(Tool):
                     output.get("output_type") == "error" for output in outputs
                 )
                 error = next(
-                    (output for output in outputs if output.get("output_type") == "error"),
+                    (
+                        output
+                        for output in outputs
+                        if output.get("output_type") == "error"
+                    ),
                     None,
                 )
                 entry = {
@@ -1674,7 +1702,9 @@ class ColabRuntimeManagementTool(Tool):
                     "startedAt": started_at,
                     "endedAt": ended_at,
                     "durationSeconds": ended_at - started_at,
-                    "status": "timeout" if timed_out else ("error" if has_error else "success"),
+                    "status": "timeout"
+                    if timed_out
+                    else ("error" if has_error else "success"),
                     "hasError": has_error,
                     "timedOut": timed_out,
                     "executionCount": payload.get("execution_count"),
@@ -1730,7 +1760,9 @@ class ColabRuntimeManagementTool(Tool):
 
         if self.name == "replace_cells":
             if arguments.get("replaceExisting", False):
-                existing = await self._call_colab("get_cells", {"includeOutputs": False})
+                existing = await self._call_colab(
+                    "get_cells", {"includeOutputs": False}
+                )
                 for cell in reversed(json.loads(self._result_text(existing))["cells"]):
                     await self._call_colab("delete_cell", {"cellId": cell["id"]})
             cell_index = arguments.get("cellIndex")
@@ -1762,7 +1794,9 @@ class ColabRuntimeManagementTool(Tool):
                         {"cellIndex": cell_index, "content": source},
                     )
                 cell_id = json.loads(self._result_text(added))["newCellId"]
-                inserted.append({"cellId": cell_id, "cellType": cell_type or "markdown"})
+                inserted.append(
+                    {"cellId": cell_id, "cellType": cell_type or "markdown"}
+                )
                 cell_index += 1
             return ToolResult(
                 content=[
@@ -1775,20 +1809,61 @@ class ColabRuntimeManagementTool(Tool):
             )
 
         if self.name == "patch_cell":
+            cell_id = arguments["cellId"]
+            target = arguments.get("target")
+
+            if target is not None:
+                replacement = arguments.get("replacement", "")
+                count = arguments.get("count", -1)
+
+                cells_result = await self._call_colab("get_cells", {"includeOutputs": False})
+                cells = json.loads(self._result_text(cells_result)).get("cells", [])
+                cell = next((c for c in cells if c.get("id") == cell_id), None)
+                if cell is None:
+                    raise ValueError(f"Cell not found: {cell_id}")
+
+                current_content = self._cell_source(cell)
+                if target not in current_content:
+                    raise ValueError(f"Target text not found in cell '{cell_id}'")
+
+                occurrences = current_content.count(target)
+                if count is None or count < 0:
+                    new_content = current_content.replace(target, replacement)
+                    replaced_count = occurrences
+                else:
+                    new_content = current_content.replace(target, replacement, count)
+                    replaced_count = min(count, occurrences)
+
+                result = await self._call_colab(
+                    "update_cell",
+                    {"cellId": cell_id, "content": new_content},
+                )
+                return ToolResult(
+                    content=result.content,
+                    structured_content={
+                        "cellId": cell_id,
+                        "updated": True,
+                        "patched": True,
+                        "replacedCount": replaced_count,
+                        "occurrences": occurrences,
+                    },
+                )
+
             content = arguments.get("source", arguments.get("content"))
             if content is None:
-                raise ValueError("patch_cell requires source or content")
+                raise ValueError("patch_cell requires target (and optional replacement) or source or content")
             result = await self._call_colab(
                 "update_cell",
-                {"cellId": arguments["cellId"], "content": content},
+                {"cellId": cell_id, "content": content},
             )
             structured_content = getattr(result, "structuredContent", None)
-            if structured_content is None:
+            if not isinstance(structured_content, (dict, list)):
                 structured_content = getattr(result, "structured_content", None)
+            if not isinstance(structured_content, (dict, list)):
+                structured_content = {"cellId": cell_id, "updated": True}
             return ToolResult(
                 content=result.content,
-                structured_content=structured_content
-                or {"cellId": arguments["cellId"], "updated": True},
+                structured_content=structured_content,
             )
 
         if self.name == "find_cells":
@@ -1814,7 +1889,9 @@ class ColabRuntimeManagementTool(Tool):
                     )
                 matched = True
                 if query:
-                    matched = bool(pattern.search(haystack)) if pattern else query in haystack
+                    matched = (
+                        bool(pattern.search(haystack)) if pattern else query in haystack
+                    )
                 if matched:
                     matches.append({"index": index, "cell": cell})
             return ToolResult(
@@ -1845,7 +1922,9 @@ class ColabRuntimeManagementTool(Tool):
                     for index, cell in enumerate(cells)
                     if cell.get("id") in cell_ids
                 ]
-                if statuses and all(status["state"] in target_states for status in statuses):
+                if statuses and all(
+                    status["state"] in target_states for status in statuses
+                ):
                     break
                 if asyncio.get_running_loop().time() >= deadline:
                     timed_out = True
@@ -1874,7 +1953,11 @@ class ColabRuntimeManagementTool(Tool):
             include_outputs = self.name != "get_cell" or bool(
                 arguments.get("includeOutputs", False)
             )
-            if self.name in {"get_cell_status", "read_cell_outputs", "watch_cell_outputs"}:
+            if self.name in {
+                "get_cell_status",
+                "read_cell_outputs",
+                "watch_cell_outputs",
+            }:
                 include_outputs = True
             if self.name == "watch_cell_outputs":
                 deadline = asyncio.get_running_loop().time() + float(
@@ -1990,10 +2073,6 @@ class ColabRuntimeManagementTool(Tool):
             )
             payload = await self._run_terminal_python(code, timeout_seconds=30)
             try:
-                info = self._proxy_client.wss.connection_info()
-                _navigate_controlled_edge(
-                    info["scratchUrl"], token=info["token"], mcp_port=info["port"]
-                )
                 value = await asyncio.to_thread(
                     _evaluate_colab_page,
                     _runtime_accelerator_state_expression(),
@@ -2005,9 +2084,7 @@ class ColabRuntimeManagementTool(Tool):
                 payload.setdefault("warnings", []).append(
                     f"Could not inspect accelerator UI state: {exc}"
                 )
-            return self._terminal_tool_result(
-                payload
-            )
+            return self._terminal_tool_result(payload)
 
         if self.name == "check_gpu":
             code = (
@@ -2048,9 +2125,17 @@ class ColabRuntimeManagementTool(Tool):
         if self.name == "connect_runtime":
             wait_seconds = int(arguments.get("waitSeconds", 180))
             info = self._proxy_client.wss.connection_info()
-            browser_connected = _navigate_controlled_edge(
-                info["scratchUrl"], token=info["token"], mcp_port=info["port"]
-            )
+            browser_connected = self._proxy_client.is_connected()
+            if not browser_connected:
+                active_url = get_active_notebook_url()
+                target_url = (
+                    f"{resolve_notebook_url(active_url)}#mcpProxyToken={info['token']}&mcpProxyPort={info['port']}"
+                    if active_url
+                    else info["scratchUrl"]
+                )
+                browser_connected = _navigate_controlled_edge(
+                    target_url, token=info["token"], mcp_port=info["port"]
+                )
             value = await asyncio.to_thread(
                 _evaluate_colab_page,
                 _runtime_connection_expression(wait_seconds),
@@ -2079,9 +2164,17 @@ class ColabRuntimeManagementTool(Tool):
             accelerator = arguments.get("accelerator") or "T4 GPU"
             apply = bool(arguments.get("apply", True))
             info = self._proxy_client.wss.connection_info()
-            connected = _navigate_controlled_edge(
-                info["scratchUrl"], token=info["token"], mcp_port=info["port"]
-            )
+            connected = self._proxy_client.is_connected()
+            if not connected:
+                active_url = get_active_notebook_url()
+                target_url = (
+                    f"{resolve_notebook_url(active_url)}#mcpProxyToken={info['token']}&mcpProxyPort={info['port']}"
+                    if active_url
+                    else info["scratchUrl"]
+                )
+                connected = _navigate_controlled_edge(
+                    target_url, token=info["token"], mcp_port=info["port"]
+                )
             value = await asyncio.to_thread(
                 _evaluate_colab_page,
                 _runtime_accelerator_expression(accelerator, apply),
@@ -2176,7 +2269,9 @@ class ColabRuntimeManagementTool(Tool):
                 "emit(result)\n"
             )
             return self._terminal_tool_result(
-                await self._run_terminal_python(code, timeout_seconds=timeout_seconds + 5)
+                await self._run_terminal_python(
+                    code, timeout_seconds=timeout_seconds + 5
+                )
             )
 
         if self.name == "start_background_command":
@@ -2204,7 +2299,7 @@ class ColabRuntimeManagementTool(Tool):
                 "os.makedirs(os.path.dirname(log_path) or '.', exist_ok=True)\n"
                 "status_path = os.path.join(log_dir, safe_name + '.status.json')\n"
                 "supervisor_path = os.path.join(log_dir, safe_name + '.supervisor.py')\n"
-                "supervisor = f\"\"\"\n"
+                'supervisor = f"""\n'
                 "import json, os, subprocess, time\n"
                 "command = {command!r}\n"
                 "name = {name!r}\n"
@@ -2229,7 +2324,7 @@ class ColabRuntimeManagementTool(Tool):
                 "except BaseException as exc:\n"
                 "    status.update({{'running': False, 'returncode': None, 'finishedAt': time.time(), 'durationSeconds': time.time() - started_at, 'error': repr(exc)}})\n"
                 "    write_status(status)\n"
-                "\"\"\"\n"
+                '"""\n'
                 "with open(supervisor_path, 'w', encoding='utf-8') as f:\n"
                 "    f.write(textwrap.dedent(supervisor).lstrip())\n"
                 "proc = subprocess.Popen([sys.executable, '-u', supervisor_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
@@ -2536,7 +2631,9 @@ class ColabRuntimeManagementTool(Tool):
                 "emit({'samples': samples, 'savePath': save_path, 'executionBackend': 'colab-terminal'})\n"
             )
             return self._terminal_tool_result(
-                await self._run_terminal_python(code, timeout_seconds=int(interval * max(count - 1, 0)) + 30)
+                await self._run_terminal_python(
+                    code, timeout_seconds=int(interval * max(count - 1, 0)) + 30
+                )
             )
 
         if self.name in {"start_gpu_monitor", "stop_gpu_monitor", "read_gpu_monitor"}:
@@ -2667,7 +2764,9 @@ class ColabRuntimeManagementTool(Tool):
             source_cells = notebook.get("cells", [])
 
             if arguments.get("replaceExisting", False):
-                existing = await self._call_colab("get_cells", {"includeOutputs": False})
+                existing = await self._call_colab(
+                    "get_cells", {"includeOutputs": False}
+                )
                 for cell in reversed(json.loads(self._result_text(existing))["cells"]):
                     await self._call_colab("delete_cell", {"cellId": cell["id"]})
 
@@ -2765,7 +2864,7 @@ class ColabRuntimeManagementTool(Tool):
         else:
             raise RuntimeError(f"Unknown Colab management tool: {self.name}")
 
-        cell_id, result = await self._append_and_run_code(code)
+        cell_id, result = await self._append_and_run_code(code, delete_after=True)
         return ToolResult(
             content=result.content,
             structured_content={"cellId": cell_id, "requested": self.name},
@@ -2858,13 +2957,43 @@ class ColabProxyMiddleware(Middleware):
             )
 
 
-async def check_session_proxy_tool_fn(ctx: Context = CurrentContext()) -> bool:
+_ACTIVE_NOTEBOOK_URL: str | None = None
+
+
+def get_active_notebook_url() -> str | None:
+    global _ACTIVE_NOTEBOOK_URL
+    return _ACTIVE_NOTEBOOK_URL
+
+
+def set_active_notebook_url(url: str | None) -> None:
+    global _ACTIVE_NOTEBOOK_URL
+    if url and str(url).strip():
+        _ACTIVE_NOTEBOOK_URL = str(url).strip()
+
+
+def resolve_notebook_url(notebook_url: str | None = None) -> str:
+    if not notebook_url or not str(notebook_url).strip():
+        return f"{COLAB}{SCRATCH_PATH}"
+    url = str(notebook_url).strip().split("#")[0]
+    if url.startswith("/"):
+        url = f"{COLAB}{url}"
+    return url
+
+
+async def check_session_proxy_tool_fn(
+    ctx: Context = CurrentContext(),
+    notebook_url: str | None = None,
+) -> bool:
     fe_connected = ctx.get_state(FE_CONNECTED_KEY)
     token = ctx.get_state(PROXY_TOKEN_KEY)
     port = ctx.get_state(PROXY_PORT_KEY)
-    if fe_connected:
+    if notebook_url:
+        set_active_notebook_url(notebook_url)
+    target_url_str = notebook_url or get_active_notebook_url()
+    base_url = resolve_notebook_url(target_url_str)
+    url = f"{base_url}#mcpProxyToken={token}&mcpProxyPort={port}"
+    if fe_connected and not notebook_url:
         return True
-    url = f"{COLAB}{SCRATCH_PATH}#mcpProxyToken={token}&mcpProxyPort={port}"
     return _navigate_controlled_edge(url, token=token, mcp_port=port)
 
 
@@ -2959,13 +3088,36 @@ def _ensure_controlled_edge(url: str, *, port: str) -> None:
 
 def _colab_page_websocket_url() -> str:
     port = os.environ.get(EDGE_CDP_PORT_ENV, DEFAULT_EDGE_CDP_PORT)
-    url_contains = os.environ.get(EDGE_CDP_URL_CONTAINS_ENV, "colab.research.google.com")
+    url_contains = os.environ.get(
+        EDGE_CDP_URL_CONTAINS_ENV, "colab.research.google.com"
+    )
     pages = [
         tab
         for tab in _cdp_json(f"http://127.0.0.1:{port}/json/list")
         if tab.get("type") == "page"
     ]
-    target = next((tab for tab in pages if url_contains in tab.get("url", "")), None)
+    candidates = [tab for tab in pages if url_contains in tab.get("url", "")]
+    if not candidates:
+        raise RuntimeError(
+            "No controlled Colab tab found. Call open_colab_browser_connection first."
+        )
+
+    active_url = get_active_notebook_url()
+    target = None
+    if active_url:
+        clean_active = active_url.split("#")[0].split("?")[0]
+        if clean_active and not clean_active.endswith("empty.ipynb"):
+            target = next(
+                (tab for tab in candidates if clean_active in tab.get("url", "")), None
+            )
+    if target is None:
+        target = next(
+            (tab for tab in candidates if "empty.ipynb" not in tab.get("url", "")),
+            None,
+        )
+    if target is None:
+        target = candidates[0]
+
     if not target or "webSocketDebuggerUrl" not in target:
         raise RuntimeError(
             "No controlled Colab tab found. Call open_colab_browser_connection first."
@@ -3014,7 +3166,9 @@ JSON.stringify((()=>{
 """
     evaluation = _evaluate_colab_page(expression)
     if "exceptionDetails" in evaluation:
-        raise RuntimeError(json.dumps(evaluation["exceptionDetails"], ensure_ascii=False))
+        raise RuntimeError(
+            json.dumps(evaluation["exceptionDetails"], ensure_ascii=False)
+        )
     value = evaluation.get("result", {}).get("value")
     if not isinstance(value, str):
         raise RuntimeError("Could not read Colab terminal endpoint from the browser.")
@@ -3031,21 +3185,21 @@ JSON.stringify((()=>{
 def _terminal_websocket_url(info: dict) -> str:
     parsed = urllib.parse.urlparse(info["url"])
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    query = [
-        (key, value)
-        for key, value in query
-        if key != "colab-runtime-proxy-token"
-    ]
+    query = [(key, value) for key, value in query if key != "colab-runtime-proxy-token"]
     query.append(("colab-runtime-proxy-token", info["token"]))
-    return urllib.parse.urlunparse(
-        parsed._replace(query=urllib.parse.urlencode(query))
-    )
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
 def _runtime_base_url(info: dict) -> str:
     parsed = urllib.parse.urlparse(info["url"])
     return urllib.parse.urlunparse(
-        parsed._replace(scheme="https" if parsed.scheme == "wss" else "http", path="", params="", query="", fragment="")
+        parsed._replace(
+            scheme="https" if parsed.scheme == "wss" else "http",
+            path="",
+            params="",
+            query="",
+            fragment="",
+        )
     ).rstrip("/")
 
 
@@ -3136,12 +3290,14 @@ def _runtime_browser_write_file(path: str, data: bytes) -> dict:
   const bytes = new Uint8Array(raw.length);
   for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
   const response = await kf.write({json.dumps(parent)}, {json.dumps(name)}, bytes.buffer, {{canceled:false, update:()=>{{}}}});
-  return JSON.stringify({{ok: !!response?.ok, status: response?.status || null, statusText: response?.statusText || '', path: {json.dumps('/' + path.strip('/'))}}});
+  return JSON.stringify({{ok: !!response?.ok, status: response?.status || null, statusText: response?.statusText || '', path: {json.dumps("/" + path.strip("/"))}}});
 }})()
 """
     evaluation = _evaluate_colab_page(script, await_promise=True)
     if "exceptionDetails" in evaluation:
-        raise RuntimeError(json.dumps(evaluation["exceptionDetails"], ensure_ascii=False))
+        raise RuntimeError(
+            json.dumps(evaluation["exceptionDetails"], ensure_ascii=False)
+        )
     raw_value = evaluation.get("result", {}).get("value")
     result = json.loads(raw_value) if isinstance(raw_value, str) else {}
     if result.get("loginRequired"):
@@ -3160,7 +3316,9 @@ def _resolve_local_path(path: str, *, purpose: str) -> Path:
     return Path(path).expanduser().resolve()
 
 
-def _runtime_download_bytes(path: str, *, offset: int = 0, max_bytes: int | None = None) -> tuple[bytes, int]:
+def _runtime_download_bytes(
+    path: str, *, offset: int = 0, max_bytes: int | None = None
+) -> tuple[bytes, int]:
     headers = {}
     if offset or max_bytes is not None:
         end = "" if max_bytes is None else str(offset + max_bytes - 1)
@@ -3178,7 +3336,9 @@ def _runtime_download_bytes(path: str, *, offset: int = 0, max_bytes: int | None
     return data, size if size is not None else offset + len(data)
 
 
-def _runtime_make_directory(path: str, *, parents: bool = True, exist_ok: bool = True) -> dict:
+def _runtime_make_directory(
+    path: str, *, parents: bool = True, exist_ok: bool = True
+) -> dict:
     targets = _runtime_parent_dirs(path + "/child") if parents else [path]
     last = None
     for target in targets:
@@ -3200,12 +3360,18 @@ def _runtime_make_directory(path: str, *, parents: bool = True, exist_ok: bool =
 
 
 def _runtime_upload_file(
-    path: str, content_base64: str, *, overwrite: bool = False, make_parents: bool = True
+    path: str,
+    content_base64: str,
+    *,
+    overwrite: bool = False,
+    make_parents: bool = True,
 ) -> dict:
     if make_parents:
         for parent in _runtime_parent_dirs(path):
             with contextlib.suppress(urllib.error.HTTPError):
-                _runtime_contents_request(parent, method="PUT", body={"type": "directory"})
+                _runtime_contents_request(
+                    parent, method="PUT", body={"type": "directory"}
+                )
     if not overwrite:
         with contextlib.suppress(urllib.error.HTTPError):
             _runtime_contents_request(path, content=False)
@@ -3297,7 +3463,9 @@ def _runtime_download_file_to_local(
     }
 
 
-def _runtime_download_file_chunk(path: str, *, offset: int = 0, max_bytes: int = 1048576) -> dict:
+def _runtime_download_file_chunk(
+    path: str, *, offset: int = 0, max_bytes: int = 1048576
+) -> dict:
     chunk, size = _runtime_download_bytes(path, offset=offset, max_bytes=max_bytes)
     next_offset = offset + len(chunk)
     return {
@@ -3332,7 +3500,13 @@ def _runtime_stat_file(path: str) -> dict:
 def _runtime_list_files(
     path: str = ".", *, recursive: bool = False, max_entries: int = 1000
 ) -> dict:
-    root = path if path.startswith("/") else f"/content/{path}" if path != "." else "/content"
+    root = (
+        path
+        if path.startswith("/")
+        else f"/content/{path}"
+        if path != "."
+        else "/content"
+    )
     entries = []
 
     def visit(current: str):
@@ -3365,9 +3539,16 @@ def _runtime_list_files(
     }
 
 
-def _runtime_delete_file(path: str, *, recursive: bool = False, force: bool = False) -> dict:
+def _runtime_delete_file(
+    path: str, *, recursive: bool = False, force: bool = False
+) -> dict:
     real_path = "/" + path.lstrip("/")
-    allowed = real_path == "/content" or real_path.startswith("/content/") or real_path == "/tmp" or real_path.startswith("/tmp/")
+    allowed = (
+        real_path == "/content"
+        or real_path.startswith("/content/")
+        or real_path == "/tmp"
+        or real_path.startswith("/tmp/")
+    )
     if not force and not allowed:
         raise PermissionError(
             f"Refusing to delete outside /content or /tmp without force=true: {real_path}"
@@ -3375,7 +3556,9 @@ def _runtime_delete_file(path: str, *, recursive: bool = False, force: bool = Fa
     if recursive:
         with contextlib.suppress(Exception):
             for entry in sorted(
-                _runtime_list_files(real_path, recursive=True, max_entries=100000)["entries"],
+                _runtime_list_files(real_path, recursive=True, max_entries=100000)[
+                    "entries"
+                ],
                 key=lambda item: item["path"].count("/"),
                 reverse=True,
             ):
@@ -3423,7 +3606,9 @@ def _runtime_upload_file_chunk(
     }
 
 
-def _runtime_complete_upload(upload_id: str, path: str, *, overwrite: bool = False) -> dict:
+def _runtime_complete_upload(
+    upload_id: str, path: str, *, overwrite: bool = False
+) -> dict:
     import hashlib
 
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", upload_id).strip("_") or "upload"
@@ -3485,7 +3670,9 @@ def _run_direct_terminal_command(
         ws.send(json.dumps({"data": command + "; stty echo\r"}))
         while time.monotonic() < deadline:
             try:
-                message = ws.recv(timeout=min(1.0, max(0.1, deadline - time.monotonic())))
+                message = ws.recv(
+                    timeout=min(1.0, max(0.1, deadline - time.monotonic()))
+                )
             except TimeoutError:
                 continue
             data, ack = _terminal_message_data(message)
@@ -4047,7 +4234,9 @@ def _navigate_controlled_edge(
     url: str, *, token: str | None = None, mcp_port: int | str | None = None
 ) -> bool:
     port = os.environ.get(EDGE_CDP_PORT_ENV, DEFAULT_EDGE_CDP_PORT)
-    url_contains = os.environ.get(EDGE_CDP_URL_CONTAINS_ENV, "colab.research.google.com")
+    url_contains = os.environ.get(
+        EDGE_CDP_URL_CONTAINS_ENV, "colab.research.google.com"
+    )
     try:
         _ensure_controlled_edge(url, port=port)
         pages = [
@@ -4055,10 +4244,20 @@ def _navigate_controlled_edge(
             for tab in _cdp_json(f"http://127.0.0.1:{port}/json/list")
             if tab.get("type") == "page"
         ]
-        target = next(
-            (tab for tab in pages if url_contains in tab.get("url", "")),
-            None,
-        )
+        candidates = [tab for tab in pages if url_contains in tab.get("url", "")]
+        target = None
+        clean_url = url.split("#")[0].split("?")[0]
+        if clean_url and not clean_url.endswith("empty.ipynb"):
+            target = next(
+                (tab for tab in candidates if clean_url in tab.get("url", "")), None
+            )
+        if target is None:
+            target = next(
+                (tab for tab in candidates if "empty.ipynb" not in tab.get("url", "")),
+                None,
+            )
+        if target is None and candidates:
+            target = candidates[0]
         if target is None:
             encoded_url = urllib.parse.quote(url, safe="")
             target = _cdp_json(
@@ -4092,9 +4291,7 @@ def _navigate_controlled_edge(
         return False
 
 
-def _connect_colab_tab(
-    websocket_url: str, url: str, token: str, mcp_port: str
-) -> bool:
+def _connect_colab_tab(websocket_url: str, url: str, token: str, mcp_port: str) -> bool:
     deadline = time.monotonic() + UI_CONNECTION_TIMEOUT
     last_ready = None
     while time.monotonic() < deadline:
@@ -4165,9 +4362,7 @@ def _connect_colab_tab(
     )
 
 
-def _edge_cdp_eval(
-    websocket_url: str, expression: str, *, await_promise: bool = False
-):
+def _edge_cdp_eval(websocket_url: str, expression: str, *, await_promise: bool = False):
     return _edge_cdp_call(
         websocket_url,
         "Runtime.evaluate",
@@ -4195,7 +4390,12 @@ def _edge_cdp_call(websocket_url: str, method: str, params: dict):
 check_session_proxy_tool = Tool.from_function(
     fn=check_session_proxy_tool_fn,
     name=INJECTED_TOOL_NAME,
-    description="Opens a connection to a Google Colab browser session and unlocks notebook editing tools. Returns a boolean representing whether the connection attempt succeeded",
+    description=(
+        "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. "
+        "Optionally accepts a 'notebook_url' (e.g. https://colab.research.google.com/drive/xxx) "
+        "to open an existing notebook instead of an empty scratchpad. "
+        "Returns a boolean representing whether the connection attempt succeeded."
+    ),
 )
 
 

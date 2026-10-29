@@ -47,7 +47,8 @@ def get_json(url: str, timeout: float = 2) -> Any:
 
 def edge_path() -> Path:
     candidates = [
-        os.environ.get("ProgramFiles(x86)", "") + r"\Microsoft\Edge\Application\msedge.exe",
+        os.environ.get("ProgramFiles(x86)", "")
+        + r"\Microsoft\Edge\Application\msedge.exe",
         os.environ.get("ProgramFiles", "") + r"\Microsoft\Edge\Application\msedge.exe",
     ]
     for candidate in candidates:
@@ -159,7 +160,9 @@ class CdpSession:
         if self._ws is None:
             raise RuntimeError("CDP session is not open.")
         message_id = next(self._ids)
-        self._ws.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
+        self._ws.send(
+            json.dumps({"id": message_id, "method": method, "params": params or {}})
+        )
         while True:
             message = json.loads(self._ws.recv())
             if message.get("id") == message_id:
@@ -273,7 +276,9 @@ JSON.stringify((()=>{
 def command_connect(args: argparse.Namespace) -> None:
     state = active_state()
     if not state:
-        raise RuntimeError(f"No MCP state file found at {MCP_STATE}. Start colab-mcp first.")
+        raise RuntimeError(
+            f"No MCP state file found at {MCP_STATE}. Start colab-mcp first."
+        )
     processes = colab_mcp_processes()
     state_pid = state.get("pid")
     other_processes = [
@@ -297,6 +302,13 @@ def command_connect(args: argparse.Namespace) -> None:
             f"activeStatePid={state_pid}, otherPids={[p.get('ProcessId') for p in other_processes]}"
         )
     scratch_url = state["scratchUrl"]
+    if getattr(args, "url", None):
+        target_base = str(args.url).strip().split("#")[0]
+        if target_base.startswith("/"):
+            target_base = f"https://colab.research.google.com{target_base}"
+        scratch_url = (
+            f"{target_base}#mcpProxyToken={state['token']}&mcpProxyPort={state['port']}"
+        )
     start_edge(args.port, args.profile, scratch_url)
     tab = create_or_get_colab_tab(args.port, scratch_url)
     with CdpSession(tab["webSocketDebuggerUrl"]) as cdp:
@@ -382,7 +394,13 @@ def command_eval(args: argparse.Namespace) -> None:
     expr = args.expression
     if args.file:
         expr = Path(args.file).read_text(encoding="utf-8")
-    print(json.dumps(eval_colab(args.port, expr, args.await_promise), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            eval_colab(args.port, expr, args.await_promise),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 def command_list_tabs(args: argparse.Namespace) -> None:
@@ -390,7 +408,11 @@ def command_list_tabs(args: argparse.Namespace) -> None:
 
 
 def command_snapshot(args: argparse.Namespace) -> None:
-    print(json.dumps(eval_colab(args.port, VISIBLE_INTERACTIVES_JS), ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            eval_colab(args.port, VISIBLE_INTERACTIVES_JS), ensure_ascii=False, indent=2
+        )
+    )
 
 
 def command_click_text(args: argparse.Namespace) -> None:
@@ -456,7 +478,11 @@ def command_keepalive(args: argparse.Namespace) -> None:
             result = cdp.evaluate(script)
         value = result.get("result", {}).get("value")
         try:
-            payload = json.loads(value) if isinstance(value, str) else {"ok": False, "raw": result}
+            payload = (
+                json.loads(value)
+                if isinstance(value, str)
+                else {"ok": False, "raw": result}
+            )
         except json.JSONDecodeError:
             payload = {"ok": False, "raw": value}
         payload["beat"] = beats
@@ -682,7 +708,9 @@ def command_smoke_mcp(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Local browser/control helper for colab-mcp.")
+    parser = argparse.ArgumentParser(
+        description="Local browser/control helper for colab-mcp."
+    )
     parser.add_argument(
         "--port",
         type=int,
@@ -698,6 +726,11 @@ def build_parser() -> argparse.ArgumentParser:
     connect.add_argument("--profile", type=Path, default=DEFAULT_PROFILE)
     connect.add_argument("--timeout", type=float, default=120)
     connect.add_argument("--allow-ambiguous", action="store_true")
+    connect.add_argument(
+        "--url",
+        help="Target notebook URL to open (e.g. https://colab.research.google.com/drive/xxx)",
+        default=None,
+    )
     connect.set_defaults(func=command_connect)
 
     eval_cmd = sub.add_parser("eval")
@@ -723,14 +756,34 @@ def build_parser() -> argparse.ArgumentParser:
     click_text.set_defaults(func=command_click_text)
 
     keepalive = sub.add_parser("keepalive")
-    keepalive.add_argument("--interval", type=float, default=300, help="Seconds between keepalive interactions.")
-    keepalive.add_argument("--count", type=int, default=1, help="Number of keepalive interactions when --forever is not set.")
-    keepalive.add_argument("--forever", action="store_true", help="Run until interrupted.")
+    keepalive.add_argument(
+        "--interval",
+        type=float,
+        default=300,
+        help="Seconds between keepalive interactions.",
+    )
+    keepalive.add_argument(
+        "--count",
+        type=int,
+        default=1,
+        help="Number of keepalive interactions when --forever is not set.",
+    )
+    keepalive.add_argument(
+        "--forever", action="store_true", help="Run until interrupted."
+    )
     keepalive.set_defaults(func=command_keepalive)
 
     set_accelerator = sub.add_parser("set-accelerator")
-    set_accelerator.add_argument("--accelerator", default="GPU", help="Accelerator option to choose, e.g. GPU, T4 GPU, TPU, None.")
-    set_accelerator.add_argument("--no-apply", action="store_true", help="Select the option but do not press Save/Apply.")
+    set_accelerator.add_argument(
+        "--accelerator",
+        default="GPU",
+        help="Accelerator option to choose, e.g. GPU, T4 GPU, TPU, None.",
+    )
+    set_accelerator.add_argument(
+        "--no-apply",
+        action="store_true",
+        help="Select the option but do not press Save/Apply.",
+    )
     set_accelerator.set_defaults(func=command_set_accelerator)
 
     return parser
@@ -746,7 +799,10 @@ def main() -> None:
     try:
         args.func(args)
     except Exception as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        print(
+            json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False, indent=2),
+            file=sys.stderr,
+        )
         raise SystemExit(1)
 
 
