@@ -26,6 +26,10 @@ def isolated_state_path(monkeypatch, tmp_path):
         "colab_mcp.websocket_server.STATE_PATH",
         tmp_path / "colab-mcp-current.json",
     )
+    monkeypatch.setattr(
+        "colab_mcp.websocket_server.TOKEN_PATH",
+        tmp_path / "colab-mcp-token.txt",
+    )
 
 
 @pytest.mark.asyncio
@@ -298,3 +302,21 @@ async def test_reconnection_resets_streams():
         assert received_msg.message == JSONRPCMessage(test_message)
 
         await client2.close()
+
+
+@pytest.mark.asyncio
+async def test_token_persistence():
+    server1 = ColabWebSocketServer()
+    token1 = server1.token
+    server2 = ColabWebSocketServer()
+    token2 = server2.token
+    assert token1 == token2
+
+
+@pytest.mark.asyncio
+async def test_preferred_port_fallback():
+    async with ColabWebSocketServer(port=0) as s1:
+        # Request the same port on s2, which is already in use
+        async with ColabWebSocketServer(port=s1.port) as s2:
+            assert s2.port != s1.port
+            assert s2.port > 0

@@ -37,6 +37,27 @@ COLAB = "https://colab.research.google.com"
 COLAB_ALT_DOMAIN = "https://colab.google.com"
 SCRATCH_PATH = "/notebooks/empty.ipynb"
 STATE_PATH = Path(tempfile.gettempdir()) / "colab-mcp-current.json"
+TOKEN_PATH = Path(tempfile.gettempdir()) / "colab-mcp-token.txt"
+DEFAULT_PREFERRED_PORT = int(os.environ.get("COLAB_MCP_PORT", "65036"))
+
+
+def _get_or_create_token() -> str:
+    env_token = os.environ.get("COLAB_MCP_TOKEN")
+    if env_token:
+        return env_token.strip()
+    try:
+        if TOKEN_PATH.exists():
+            saved = TOKEN_PATH.read_text(encoding="utf-8").strip()
+            if len(saved) >= 16:
+                return saved
+    except Exception:
+        pass
+    new_token = secrets.token_urlsafe(16)
+    try:
+        TOKEN_PATH.write_text(new_token, encoding="utf-8")
+    except Exception:
+        pass
+    return new_token
 
 
 class ColabWebSocketServer:
@@ -45,8 +66,9 @@ class ColabWebSocketServer:
     from a Google Colab session (colab.google.com).
     """
 
-    def __init__(self, host="127.0.0.1"):
+    def __init__(self, host="127.0.0.1", port: int | None = None, token: str | None = None):
         self.host = host
+        self.requested_port = DEFAULT_PREFERRED_PORT if port is None else port
         self.port = 0
         self.connection_lock = asyncio.Lock()
         self.connection_live = asyncio.Event()
@@ -66,7 +88,7 @@ class ColabWebSocketServer:
         self.write_stream, self._write_stream_reader = (
             anyio.create_memory_object_stream(0)
         )
-        self.token = secrets.token_urlsafe(16)
+        self.token = token or _get_or_create_token()
 
     def _reset_streams(self):
         """Safely closes existing streams and re-creates clean memory streams for new connections."""
@@ -232,14 +254,31 @@ class ColabWebSocketServer:
                 self.connection_live.clear()
 
     async def __aenter__(self):
-        self._server = await websockets.serve(
-            self._connection_handler,
-            host=self.host,
-            port=0,
-            subprotocols=[Subprotocol("mcp")],
-            origins=self.allowed_origins,
-            process_request=self._validate_authorization,
-        )
+        bind_port = self.requested_port
+        try:
+            self._server = await websockets.serve(
+                self._connection_handler,
+                host=self.host,
+                port=bind_port,
+                subprotocols=[Subprotocol("mcp")],
+                origins=self.allowed_origins,
+                process_request=self._validate_authorization,
+            )
+        except OSError as e:
+            if bind_port != 0:
+                logging.warning(
+                    f"Preferred port {bind_port} unavailable ({e}), falling back to dynamic port"
+                )
+                self._server = await websockets.serve(
+                    self._connection_handler,
+                    host=self.host,
+                    port=0,
+                    subprotocols=[Subprotocol("mcp")],
+                    origins=self.allowed_origins,
+                    process_request=self._validate_authorization,
+                )
+            else:
+                raise
         self.port = self._server.sockets[0].getsockname()[1]
         self._write_state_file()
         logging.info(f"Starting WebSocket server on ws://{self.host}:{self.port}")
