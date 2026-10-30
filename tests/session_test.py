@@ -1305,7 +1305,7 @@ class TestLocalFileTransfer:
             )
         )
 
-        # 1. 默认调用：只保留最新 20 行
+        # 1. 默认调用：只保留最新 20 行，且默认不返回冗余的 outputs 与 chunks
         result = await tool.run({"cellIds": ["c1"]})
         assert result.structured_content["totalLines"]["c1"] == 50
         assert result.structured_content["returnedLines"]["c1"] == 20
@@ -1314,6 +1314,10 @@ class TestLocalFileTransfer:
         assert "line 30" in tail_text
         assert "line 29" not in tail_text
         assert len(tail_text.splitlines()) == 20
+        assert "outputs" not in result.structured_content
+        assert "chunks" not in result.structured_content
+        assert '"outputs":' not in result.content[0].text
+        assert '"chunks":' not in result.content[0].text
 
         # 2. 自定义 lines=5
         result_5 = await tool.run({"cellIds": ["c1"], "lines": 5})
@@ -1327,3 +1331,12 @@ class TestLocalFileTransfer:
         result_all = await tool.run({"cellIds": ["c1"], "lines": 0})
         assert result_all.structured_content["returnedLines"]["c1"] == 50
         assert "line 0" in result_all.structured_content["tailText"]["c1"]
+
+        # 4. 显式开启 includeRaw 与 normalize
+        result_raw = await tool.run(
+            {"cellIds": ["c1"], "includeRaw": True, "normalize": True}
+        )
+        assert "outputs" in result_raw.structured_content
+        assert "chunks" in result_raw.structured_content
+        assert '"outputs":' in result_raw.content[0].text
+        assert '"chunks":' in result_raw.content[0].text

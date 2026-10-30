@@ -702,7 +702,16 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
                     "description": "Number of latest lines of output to return per cell. Defaults to 20. Pass <= 0 to return all lines.",
                 },
                 "maxBytes": {"type": "integer", "minimum": 1, "default": 20000},
-                "normalize": {"type": "boolean", "default": True},
+                "includeRaw": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Whether to include raw Jupyter outputs array. Defaults to False to save context tokens.",
+                },
+                "normalize": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Whether to include normalized output chunks. Defaults to False.",
+                },
             },
             "required": ["cellIds"],
             "additionalProperties": False,
@@ -726,7 +735,16 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
                     "default": 0.5,
                 },
                 "maxBytes": {"type": "integer", "minimum": 1, "default": 20000},
-                "normalize": {"type": "boolean", "default": True},
+                "includeRaw": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Whether to include raw Jupyter outputs array. Defaults to False to save context tokens.",
+                },
+                "normalize": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Whether to include normalized output chunks. Defaults to False.",
+                },
             },
             "required": ["cellIds"],
             "additionalProperties": False,
@@ -2155,7 +2173,10 @@ class ColabRuntimeManagementTool(Tool):
                     structured_content={"cells": statuses},
                 )
             max_bytes = int(arguments.get("maxBytes", 20000))
-            normalize = bool(arguments.get("normalize", True))
+            normalize = bool(arguments.get("normalize", False))
+            include_raw = bool(
+                arguments.get("includeRaw", arguments.get("include_raw", False))
+            )
             lines_arg = arguments.get("lines", 20)
             lines = int(lines_arg) if lines_arg is not None else 20
             raw_outputs = {
@@ -2175,20 +2196,25 @@ class ColabRuntimeManagementTool(Tool):
                 chunks_tailed, tail_text, total_lines = self._tail_chunks_and_text(
                     norm_chunks, lines
                 )
-                tailed_chunks[cell_id] = chunks_tailed
+                if normalize:
+                    tailed_chunks[cell_id] = chunks_tailed
                 tail_texts[cell_id] = tail_text
                 total_lines_map[cell_id] = total_lines
                 returned_lines_map[cell_id] = (
                     len(tail_text.splitlines()) if tail_text else 0
                 )
-                tailed_outputs[cell_id] = self._tail_raw_outputs(cell_outputs, lines)
+                if include_raw:
+                    tailed_outputs[cell_id] = self._tail_raw_outputs(
+                        cell_outputs, lines
+                    )
 
             payload = {
-                "outputs": tailed_outputs,
                 "tailText": tail_texts,
                 "totalLines": total_lines_map,
                 "returnedLines": returned_lines_map,
             }
+            if include_raw:
+                payload["outputs"] = tailed_outputs
             if normalize:
                 payload["chunks"] = tailed_chunks
             text = json.dumps(payload, ensure_ascii=False, indent=2)
@@ -2197,16 +2223,20 @@ class ColabRuntimeManagementTool(Tool):
                 text = text.encode("utf-8")[:max_bytes].decode(
                     "utf-8", errors="replace"
                 )
+            structured_content = {
+                "tailText": tail_texts,
+                "totalLines": total_lines_map,
+                "returnedLines": returned_lines_map,
+                "truncated": truncated,
+            }
+            if include_raw:
+                structured_content["outputs"] = tailed_outputs
+            if normalize:
+                structured_content["chunks"] = tailed_chunks
+
             return ToolResult(
                 content=[TextContent(type="text", text=text)],
-                structured_content={
-                    "outputs": tailed_outputs,
-                    "chunks": tailed_chunks if normalize else None,
-                    "tailText": tail_texts,
-                    "totalLines": total_lines_map,
-                    "returnedLines": returned_lines_map,
-                    "truncated": truncated,
-                },
+                structured_content=structured_content,
             )
 
         if self.name == "check_runtime":
