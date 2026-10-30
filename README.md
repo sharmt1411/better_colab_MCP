@@ -53,7 +53,7 @@ In practice, **we strongly recommend enabling only the 16 core tools below**, le
 | **Lifecycle** | `restart_runtime` | Restart Python runtime (release GPU VRAM / memory) |
 | | `shutdown_runtime` | Fully release Colab instance after training/tasks |
 | **Hardware** | `check_gpu` | Check active GPU model and availability |
-| **Notebook Authoring** | `get_cells` | Inspect full notebook structure and all cell IDs |
+| **Notebook Authoring** | `get_cells` | Inspect full notebook structure & cell IDs (outputs excluded by default to save context) |
 | | `add_code_cell` | Add new Python code cell |
 | | `add_text_cell` | Add new Markdown text cell |
 | | `delete_cell` | Remove unwanted cells |
@@ -68,6 +68,39 @@ In practice, **we strongly recommend enabling only the 16 core tools below**, le
 > 1. **Redundancy**: Batch operations (`run_all_cells`, `run_cell_range`) can cause cascading failures; granular execution via `run_code_cell` is much safer for AI agents. `get_cells` already covers single cell lookups.
 > 2. **Shell Versatility**: Dedicated file tools (`list_files`, `make_directory`, `delete_file`) and environment tools (`set_env_vars`) are effortlessly handled with standard Linux commands via `run_shell_command` (`ls`, `mkdir`, `rm`, `export`).
 > 3. **Token Efficiency**: Pruning 50+ tools down to 16 **saves thousands of system prompt tokens** per turn, reduces hallucination, and speeds up agent response time.
+
+---
+
+## Key Agent-Centric Optimizations
+
+To ensure rock-solid reliability, prevent context exhaustion, and boost token efficiency during long-running tasks, training runs, and evaluations, this project includes comprehensive agent-centric refinements:
+
+### 1. Token Efficiency & Anti-Context-Overflow
+- **`get_cells` Streamlined (Outputs Excluded by Default)**:
+  - Defaults to `includeOutputs: false`, completely stripping bulky output arrays from cell listings to avoid blowing up the LLM's context window.
+  - Multi-line source arrays (`["line1\n", "line2\n"]`) are automatically merged into clean multi-line strings, eliminating substantial JSON quote and newline overhead.
+  - Lightweight execution metadata is extracted (`hasOutputs: bool`, `outputCount: int`, `hasError: bool`) along with an actionable `hint`, guiding the agent to query `read_cell_outputs` on demand.
+- **3x Redundant Payload Elimination in `read_cell_outputs` / `watch_cell_outputs`**:
+  - Eliminated upstream duplicate outputs (raw stdout/stderr, cellOutputs, and tailText). Only the clean `tailText` is returned by default.
+  - Defaults to reading the last 20 lines (`lines: 20`) with byte-level safeguards (`maxBytes: 20KB`).
+- **Line Numbering & Long Line Truncation Guard**:
+  - Outputs include clean 1-based line numbers (e.g., `123: log message`), aligning with standard IDE/filesystem tool conventions for precise error localization.
+  - Guarded by `maxLineChars` (default 1000 characters) to prevent unformatted or base64 single lines from causing model token overflow.
+- **ANSI Escape Code Stripping**:
+  - Terminal formatting and color escape sequences (`\x1b[...]`) are stripped clean before reaching the LLM, eliminating control-code noise and hallucination triggers.
+- **Purged Bloated DOM UI Dumps**:
+  - Runtime management tools (`check_runtime`, `connect_runtime`, `set_runtime_accelerator`) strip out hundreds of raw DOM elements (`options`, `relevant` interactive nodes), delivering concise hardware and session states.
+
+### 2. Zero-Hang Self-Healing Connection
+- **Chromium Anti-Throttling Flags**:
+  - Edge is launched with `--disable-background-timer-throttling`, `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding`, and `--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling`.
+  - Prevents Edge Sleeping Tabs and timer clamping from dropping WebSocket keepalives when the browser is unfocused, minimized, or occluded behind other windows.
+- **Floating Status Badge & Background Auto-Reconnect**:
+  - A sleek floating status pill (`#colab-mcp-status-badge`) is injected into the bottom-right corner of the Colab notebook (🟢 Connected, 🟡 Reconnecting, 🔴 Disconnected, clickable for manual reconnect).
+  - An unthrottled 4-second background heartbeat and `visibilitychange` listener silently reconnects via `localColabMcpService.connect()` if disconnected—**requiring zero manual tab focusing or clicking**.
+- **Fixed Multi-Minute Reconnection Hang / Deadlock**:
+  - `ColabWebSocketServer` resets memory streams on subsequent connections (`_reset_streams`), preventing dead connection errors from poisoning new streams.
+  - `ColabProxyClient` features a dedicated supervisor (`_connection_supervisor`) that cleans up dead sessions and initializes a fresh `ClientSession` on reconnection, eliminating the bug where reconnection attempts hung indefinitely.
 
 
 ## Project Layout

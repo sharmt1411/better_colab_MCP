@@ -53,7 +53,7 @@ Colab MCP 提供了 50+ 个细粒度工具，如果全量开启，**每个轮次
 | **生命周期管理** | `restart_runtime` | 重启 Python 运行时（快速释放显存/内存） |
 | | `shutdown_runtime` | 训练/任务完成后彻底释放 Colab 实例（避免资源浪费） |
 | **硬件状态** | `check_gpu` | 检查当前分配的 GPU 状态与可用性 |
-| **单元格增删改** | `get_cells` | 获取 Notebook 完整结构及所有 Cell ID |
+| **单元格增删改** | `get_cells` | 获取 Notebook 结构及 Cell ID（默认不带输出，极省 Token，提供轻量执行状态） |
 | | `add_code_cell` | 创建新的 Python 代码单元格 |
 | | `add_text_cell` | 创建新的 Markdown 说明单元格 |
 | | `delete_cell` | 删除冗余/无用的单元格 |
@@ -68,6 +68,39 @@ Colab MCP 提供了 50+ 个细粒度工具，如果全量开启，**每个轮次
 > 1. **功能重叠**：`run_code_cells`、`run_cell_range`、`run_all_cells` 容易造成批量级联错误，逐个调用 `run_code_cell` 粒度更可控；`get_cell` / `find_cells` 完全能被 `get_cells` 代替。
 > 2. **Shell 万能替代**：文件操作（`list_files`、`make_directory`、`delete_file`、`stat_file`）以及环境变量（`set_env_vars`、`load_env_file`），在 `run_shell_command` 中通过常规 Linux 命令（`ls`, `mkdir`, `rm`, `export`）更加灵活直接，完全无需专用 MCP 工具常驻上下文。
 > 3. **极简上下文**：将工具数从 50+ 精简至 16 个，每次对话可直接**节约数千 Token**，模型响应更快、出错率更低。
+
+---
+
+## 针对 AI Agent 调用的关键细节优化
+
+为了保证 AI Agent（如 Claude、GPT-4、Gemini 等）在长时间运行、深度训练和复杂评测任务下的稳定性与 Token 效率，本项目针对 Agent 的调用习惯做了多处深度优化：
+
+### 1. Token 效率与防上下文爆炸保护
+- **`get_cells` 深度精简（默认排除输出）**：
+  - 默认强制下发 `includeOutputs=False`，彻底从单元格数据中剥离冗长输出，避免因列出单元格导致 Agent 上下文瞬间被成千上万行日志撑爆。
+  - 源代码数组自动拼接展平为标准的单段多行字符串，省去海量 JSON 转义与换行数组冗余。
+  - 提取轻量级状态字段（`hasOutputs: bool`, `outputCount: int`, `hasError: bool`），保留关键状态感知的同时附带 `hint`，引导 Agent 按需使用 `read_cell_outputs` 精确查看。
+- **`read_cell_outputs` / `watch_cell_outputs` 消除 3 倍冗余负载**：
+  - 剔除了原始上游返回中的多重冗余（raw stdout/stderr、cellOutputs 和 tailText 重复三份的问题），默认直出清晰的 `tailText`。
+  - 建议并默认从最后 20 行读起（`lines=20`），并提供 `maxBytes`（默认 20KB）截断保护。
+- **行号对齐与单行超长折叠保护**：
+  - 输出日志自动添加真实行号前缀（如 `123: log message`），格式贴合常见代码与文件读取工具，极大提高 Agent 的错误定位精准度。
+  - 针对无换行的单行长日志（如超长 Base64、无折行的字典、minified 文本）增加 `maxLineChars` 保护（默认 1000 字符），防止单行过长打爆模型单行窗口。
+- **ANSI 终端颜色代码自动剥离**：
+  - 自动剥离终端颜色转义序列（`\x1b[...]`），杜绝因进度条、着色日志导致的乱码混淆 LLM 推理。
+- **清理无用 DOM 节点转储**：
+  - 针对 `check_runtime`、`connect_runtime`、`set_runtime_accelerator` 等运行时管理工具，彻底清洗了原版中多达上百个 DOM 元素的 UI 节点垃圾（`options`、`relevant` 等），使 Agent 仅接收干净的核心硬件与运行状态。
+
+### 2. 连接稳定性与后台失焦无感自愈
+- **Chromium 防休眠防节流参数**：
+  - Edge 浏览器默认启动包含 `--disable-background-timer-throttling`、`--disable-backgrounding-occluded-windows`、`--disable-renderer-backgrounding` 与 `--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling`。
+  - 解决失焦、最小化或被其他窗口遮挡时 Edge 自动将标签页置入沉睡（Sleeping Tab）、导致 WebSocket 心跳超时断开的顽疾。
+- **悬浮连接状态胶囊与无感后台自愈重连**：
+  - Colab 页面右下角动态注入半透明 `#colab-mcp-status-badge` 状态胶囊（🟢 已连接、🟡 重连中、🔴 已断开，支持点击立即重连）。
+  - 内置 4 秒后台定时心跳探测与 `visibilitychange` 监听，检测到断连时在后台静默重连，**完全无需用户切换或手动点击标签页**。
+- **彻底解决重连死锁/挂起数分钟 Bug**：
+  - `ColabWebSocketServer` 重连时自动重置内存流（`_reset_streams`），杜绝旧异常与断开状态污染新连接。
+  - `ColabProxyClient` 增加连接守护协程（`_connection_supervisor`），重连时自动进入全新的 `ClientSession` 上下文，彻底终结了断连后重连请求卡死挂起数分钟的问题。
 
 
 ## 项目结构

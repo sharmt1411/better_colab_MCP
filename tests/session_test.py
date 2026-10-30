@@ -1422,3 +1422,103 @@ class TestLocalFileTransfer:
         assert "A" * 250 not in tail_text
         assert "[truncated" in tail_text
         assert "chars]" in tail_text
+
+class TestStaticColabProxyTool:
+    @pytest.mark.asyncio
+    async def test_get_cells_defaults_to_no_outputs(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        raw_cells_response = {
+            "cells": [
+                {
+                    "id": "c1",
+                    "cell_type": "code",
+                    "source": ["x = 1\n", "print(x)\n"],
+                    "outputs": [
+                        {"output_type": "stream", "text": "1\n"}
+                    ],
+                },
+                {
+                    "id": "c2",
+                    "cell_type": "code",
+                    "source": "y = 2",
+                    "outputs": [
+                        {"output_type": "error", "ename": "ValueError", "evalue": "err"}
+                    ],
+                },
+            ]
+        }
+        mock_result = Mock()
+        mock_result.content = [session.TextContent(type="text", text=json.dumps(raw_cells_response))]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        get_cells_tool = tools["get_cells"]
+
+        # Call with empty arguments
+        result = await get_cells_tool.run({})
+
+        # Verify upstream was called with includeOutputs: False
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.assert_called_with(
+            "get_cells", {"includeOutputs": False}
+        )
+
+        # Verify returned JSON has outputs stripped, source flattened, and hasOutputs/outputCount/hasError added
+        parsed = json.loads(result.content[0].text)
+        cells = parsed["cells"]
+        assert len(cells) == 2
+
+        c1 = cells[0]
+        assert "outputs" not in c1
+        assert c1["source"] == "x = 1\nprint(x)\n"
+        assert c1["hasOutputs"] is True
+        assert c1["outputCount"] == 1
+        assert "hasError" not in c1
+
+        c2 = cells[1]
+        assert "outputs" not in c2
+        assert c2["hasOutputs"] is True
+        assert c2["outputCount"] == 1
+        assert c2["hasError"] is True
+
+        assert parsed["includeOutputs"] is False
+        assert "hint" in parsed
+
+    @pytest.mark.asyncio
+    async def test_get_cells_preserves_outputs_when_requested(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        raw_cells_response = {
+            "cells": [
+                {
+                    "id": "c1",
+                    "cell_type": "code",
+                    "source": "print(1)",
+                    "outputs": [{"output_type": "stream", "text": "1\n"}],
+                }
+            ]
+        }
+        mock_result = Mock()
+        mock_result.content = [session.TextContent(type="text", text=json.dumps(raw_cells_response))]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        get_cells_tool = tools["get_cells"]
+
+        result = await get_cells_tool.run({"includeOutputs": True})
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.assert_called_with(
+            "get_cells", {"includeOutputs": True}
+        )
+        parsed = json.loads(result.content[0].text)
+        c1 = parsed["cells"][0]
+        assert "outputs" in c1
+        assert c1["hasOutputs"] is True
+        assert parsed["includeOutputs"] is True

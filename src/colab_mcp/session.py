@@ -149,7 +149,7 @@ COLAB_STATIC_TOOL_SCHEMAS = {
         },
     },
     "get_cells": {
-        "description": "Gets a range of cells as JSON from the notebook.",
+        "description": "Gets a range of cells as JSON from the notebook. By default, cell outputs are excluded to keep context compact and prevent overflow; use read_cell_outputs to inspect specific cell outputs.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -168,7 +168,7 @@ COLAB_STATIC_TOOL_SCHEMAS = {
                 "includeOutputs": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Whether to include the code cell execution outputs in the response. If not provided, this defaults to false.",
+                    "description": "Whether to include code cell execution outputs in the response. Defaults to false. Recommended to keep false and use read_cell_outputs for reading outputs.",
                 },
             },
             "additionalProperties": False,
@@ -1269,8 +1269,12 @@ class StaticColabProxyTool(Tool):
                 "Colab UI is not connected. Call open_colab_browser_connection first."
             )
 
+        call_args = dict(arguments or {})
+        if self._upstream_name == "get_cells":
+            call_args.setdefault("includeOutputs", False)
+
         result = await self._proxy_client.proxy_mcp_client.call_tool_mcp(
-            self._upstream_name, arguments
+            self._upstream_name, call_args
         )
         structured_content = getattr(result, "structuredContent", None)
         if structured_content is None:
@@ -1285,8 +1289,60 @@ class StaticColabProxyTool(Tool):
             structured_content.get("error")
         )
         status = "warning" if warnings or failed else "ok"
+
+        content_items = list(result.content or [])
+        if self._upstream_name == "get_cells" and content_items:
+            include_outputs = bool(call_args.get("includeOutputs", False))
+            try:
+                raw_text = content_items[0].text
+                data = json.loads(raw_text)
+                if isinstance(data, dict) and "cells" in data:
+                    raw_cells = data.get("cells", [])
+                    cleaned_cells = []
+                    for cell in raw_cells:
+                        clean_cell = dict(cell)
+                        src = clean_cell.get("source", "")
+                        if isinstance(src, list):
+                            clean_cell["source"] = "".join(src)
+
+                        outputs = clean_cell.get("outputs") or []
+                        output_count = len(outputs)
+                        has_error = any(
+                            isinstance(o, dict) and o.get("output_type") == "error"
+                            for o in outputs
+                        )
+
+                        if not include_outputs:
+                            clean_cell.pop("outputs", None)
+                            clean_cell["hasOutputs"] = output_count > 0
+                            clean_cell["outputCount"] = output_count
+                            if has_error:
+                                clean_cell["hasError"] = True
+                        else:
+                            clean_cell["hasOutputs"] = output_count > 0
+                            clean_cell["outputCount"] = output_count
+
+                        cleaned_cells.append(clean_cell)
+
+                    data["cells"] = cleaned_cells
+                    data["cellCount"] = len(cleaned_cells)
+                    data["includeOutputs"] = include_outputs
+                    if not include_outputs:
+                        data["hint"] = "Outputs are excluded by default to conserve context. Use read_cell_outputs(cellIds=['<id>']) to view outputs."
+
+                    content_items[0] = TextContent(
+                        type="text",
+                        text=json.dumps(data, ensure_ascii=False, indent=2),
+                    )
+                    structured_content.update({
+                        "cellCount": len(cleaned_cells),
+                        "includeOutputs": include_outputs,
+                    })
+            except Exception as exc:
+                logging.debug("Failed to post-process get_cells output: %s", exc)
+
         return ToolResult(
-            content=result.content,
+            content=content_items,
             structured_content={
                 **structured_content,
                 "ok": status == "ok",
