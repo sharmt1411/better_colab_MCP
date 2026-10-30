@@ -30,7 +30,8 @@ English documentation: [README.md](README.md)
    - **全自动化流程体验**：消除了误导性的人工授权等待提示（Waiting for user connect），改用明确的底层状态日志，避免大模型误以为需人工介入。
 
 2. **📉 极致精简的 Token 消耗（Token-Optimized Logging）**
-   - **日志智能尾部截取**：`read_cell_outputs` 默认截取最新 20 行，避免大模型被成百上千行的进度条挤爆上下文。
+   - **真实行号定位与建议 20 行读起**：`read_cell_outputs` 统一格式化为带真实行号的输出（如 `123: log`），清晰对齐报错行；默认且强烈建议从最新 20 行读起。
+   - **ANSI 转义清洗与单行超长保护**：自动剥离终端彩色控制符（消除 `\u001b[35m` 等乱码）；对单行超过 1000 字符的巨型 dump（如超长权重键名、大列表）自动首尾折叠保护。
    - **Payload 三重冗余消除**：彻底移除原版中 `outputs`、`tailText`、`chunks` 三份完全重复打包的冗余设计，默认只返回精简纯文本（`tailText`），**Token 消耗立减 70%**。同时支持 `includeRaw=True` 按需提取富媒体。
 
 3. **🎯 精准的代码与环境控制**
@@ -60,7 +61,7 @@ Colab MCP 提供了 50+ 个细粒度工具，如果全量开启，**每个轮次
 | | `patch_cell` | **核心推荐**：通过 Search-and-Replace 局部精确修补代码 |
 | **代码执行与控制** | `run_code_cell` | 执行指定的代码单元格 |
 | | `cancel_queued_cells` | 取消排队中或卡死的代码执行队列 |
-| | `read_cell_outputs` | **核心推荐**：读取单元格最新执行日志（默认 20 行精简纯文本） |
+| | `read_cell_outputs` | **核心推荐**：读取单元格最新日志（带真实行号如 123: log，默认且建议从 20 行读起） |
 | **万能终端与文件** | `run_shell_command` | 执行 Linux 终端命令（pip 安装、文件查看、系统命令等） |
 
 > **为什么建议关闭其他 30+ 个工具？**

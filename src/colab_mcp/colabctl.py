@@ -622,15 +622,9 @@ def accelerator_script(accelerator: str, apply: bool) -> str:
 
   function state() {{
     const body = document.body?.innerText || '';
-    const relevant = allDeep()
-      .filter(el => visible(el))
-      .map((el, i) => ({{ i, tag: el.tagName, role: el.getAttribute?.('role') || null, text: label(el).slice(0, 180) }}))
-      .filter(item => /Runtime type|Hardware accelerator|GPU|TPU|None|Save|Apply|Restart|\u8fd0\u884c\u65f6|\u786c\u4ef6\u52a0\u901f|\u4fdd\u5b58/i.test(item.text))
-      .slice(0, 80);
     return {{
       href: location.href,
       hasGpuHint: /\b(T4|L4|A100|V100|GPU|TPU)\b/i.test(body),
-      relevant,
     }};
   }}
 

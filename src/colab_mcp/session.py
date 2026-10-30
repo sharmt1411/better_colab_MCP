@@ -68,6 +68,25 @@ def _terminal_command_lock() -> asyncio.Lock:
     return _TERMINAL_COMMAND_LOCK
 
 
+def _strip_ansi_sequences(text: str) -> str:
+    text = re.sub(r"\x1b\][^\x07]*(?:\x07|\x1b\\)", "", text)
+    text = re.sub(r"\x1b[@-Z\\-_]|\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+    return text
+
+
+def _truncate_long_line(line: str, max_line_chars: int = 1000) -> str:
+    if max_line_chars <= 0 or len(line) <= max_line_chars:
+        return line
+    head_len = int(max_line_chars * 0.6)
+    tail_len = max_line_chars - head_len - 35
+    if tail_len <= 0:
+        return line[:max_line_chars] + "... [truncated]"
+    truncated_count = len(line) - head_len - tail_len
+    return (
+        f"{line[:head_len]}... [truncated {truncated_count} chars] ...{line[-tail_len:]}"
+    )
+
+
 COLAB_STATIC_TOOL_SCHEMAS = {
     "add_code_cell": {
         "description": "Inserts a code type cell at the provided index and shifts existing cells. The resulting new cell id is returned.",
@@ -691,7 +710,7 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
         },
     },
     "read_cell_outputs": {
-        "description": "Returns outputs for selected cells, tailing the latest lines (default: 20) to prevent oversized logs.",
+        "description": "Returns outputs for selected cells, tailing the latest lines formatted with line numbers (e.g. '123: log'). Recommended to start by reading 20 lines (default: 20) to prevent oversized logs and aid navigation.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -699,9 +718,14 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
                 "lines": {
                     "type": "integer",
                     "default": 20,
-                    "description": "Number of latest lines of output to return per cell. Defaults to 20. Pass <= 0 to return all lines.",
+                    "description": "Number of latest lines of output to return per cell. Recommended to start with 20 lines (default: 20). Pass <= 0 to return all lines.",
                 },
                 "maxBytes": {"type": "integer", "minimum": 1, "default": 20000},
+                "maxLineChars": {
+                    "type": "integer",
+                    "default": 1000,
+                    "description": "Maximum characters allowed per line to prevent runaway single-line dumps. Defaults to 1000. Pass <= 0 to disable.",
+                },
                 "includeRaw": {
                     "type": "boolean",
                     "default": False,
@@ -718,7 +742,7 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
         },
     },
     "watch_cell_outputs": {
-        "description": "Polls selected cell outputs for a short period and returns the latest outputs.",
+        "description": "Polls selected cell outputs for a short period and returns the latest outputs with line numbers (e.g. '123: log'). Recommended to start by reading 20 lines (default: 20).",
         "parameters": {
             "type": "object",
             "properties": {
@@ -726,7 +750,7 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
                 "lines": {
                     "type": "integer",
                     "default": 20,
-                    "description": "Number of latest lines of output to return per cell. Defaults to 20. Pass <= 0 to return all lines.",
+                    "description": "Number of latest lines of output to return per cell. Recommended to start with 20 lines (default: 20). Pass <= 0 to return all lines.",
                 },
                 "timeoutSeconds": {"type": "number", "minimum": 0, "default": 10},
                 "pollIntervalSeconds": {
@@ -735,6 +759,11 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
                     "default": 0.5,
                 },
                 "maxBytes": {"type": "integer", "minimum": 1, "default": 20000},
+                "maxLineChars": {
+                    "type": "integer",
+                    "default": 1000,
+                    "description": "Maximum characters allowed per line to prevent runaway single-line dumps. Defaults to 1000. Pass <= 0 to disable.",
+                },
                 "includeRaw": {
                     "type": "boolean",
                     "default": False,
@@ -1280,17 +1309,35 @@ class ColabRuntimeManagementTool(Tool):
 
     @staticmethod
     def _tail_chunks_and_text(
-        chunks: list[dict], lines: int | None
+        chunks: list[dict], lines: int | None, max_line_chars: int = 1000
     ) -> tuple[list[dict], str, int]:
         """
         Tails chunks so that total lines across all chunks is at most `lines`.
+        Also strips ANSI escape sequences and truncates overlong single lines.
         Returns (tailed_chunks, joined_tail_text, total_lines_before_tail).
         """
-        all_chunk_lines = [chunk.get("text", "").splitlines() for chunk in chunks]
+        def process_chunk_lines(chunk_text: str) -> list[str]:
+            cleaned = _strip_ansi_sequences(chunk_text)
+            return [
+                _truncate_long_line(line, max_line_chars=max_line_chars)
+                for line in cleaned.splitlines()
+            ]
+
+        all_chunk_lines = [
+            process_chunk_lines(chunk.get("text", "")) for chunk in chunks
+        ]
         total_lines = sum(len(cl) for cl in all_chunk_lines)
         if lines is None or lines <= 0 or total_lines <= lines:
-            joined = "\n".join(line for cl in all_chunk_lines for line in cl)
-            return chunks, joined, total_lines
+            flat_lines = [line for cl in all_chunk_lines for line in cl]
+            joined = "\n".join(
+                f"{idx + 1}: {line}" for idx, line in enumerate(flat_lines)
+            )
+            clean_chunks = []
+            for chunk, cl in zip(chunks, all_chunk_lines):
+                new_chunk = dict(chunk)
+                new_chunk["text"] = "\n".join(cl)
+                clean_chunks.append(new_chunk)
+            return clean_chunks, joined, total_lines
 
         remaining = lines
         tailed = []
@@ -1298,7 +1345,9 @@ class ColabRuntimeManagementTool(Tool):
             if remaining <= 0:
                 break
             if len(cl) <= remaining:
-                tailed.append(chunk)
+                new_chunk = dict(chunk)
+                new_chunk["text"] = "\n".join(cl)
+                tailed.append(new_chunk)
                 remaining -= len(cl)
             else:
                 tailed_cl = cl[-remaining:]
@@ -1309,8 +1358,13 @@ class ColabRuntimeManagementTool(Tool):
                 break
 
         tailed.reverse()
-        joined = "\n".join(
+        selected_lines = [
             line for chunk in tailed for line in chunk.get("text", "").splitlines()
+        ]
+        start_line_no = total_lines - len(selected_lines) + 1
+        joined = "\n".join(
+            f"{start_line_no + idx}: {line}"
+            for idx, line in enumerate(selected_lines)
         )
         return tailed, joined, total_lines
 
@@ -2178,6 +2232,7 @@ class ColabRuntimeManagementTool(Tool):
             include_raw = bool(
                 arguments.get("includeRaw", arguments.get("include_raw", False))
             )
+            max_line_chars = int(arguments.get("maxLineChars", 1000))
             lines_arg = arguments.get("lines", 20)
             lines = int(lines_arg) if lines_arg is not None else 20
             raw_outputs = {
@@ -2195,7 +2250,7 @@ class ColabRuntimeManagementTool(Tool):
             for cell_id, cell_outputs in raw_outputs.items():
                 norm_chunks = self._normalize_outputs(cell_outputs)
                 chunks_tailed, tail_text, total_lines = self._tail_chunks_and_text(
-                    norm_chunks, lines
+                    norm_chunks, lines, max_line_chars=max_line_chars
                 )
                 if normalize:
                     tailed_chunks[cell_id] = chunks_tailed
@@ -4044,22 +4099,17 @@ def _runtime_accelerator_state_expression() -> str:
     ).trim();
   }
   const body = document.body?.innerText || '';
-  const options = allDeep()
-    .filter(el => visible(el))
-    .map(el => ({
-      tag: el.tagName,
-      role: el.getAttribute?.('role') || null,
-      text: label(el).slice(0, 160),
-      checked: Boolean(el.checked),
-    }))
-    .filter(item => /CPU|GPU|TPU|Hardware accelerator|Accelerator|硬件加速器|运行时类型|Runtime type/i.test(item.text))
-    .slice(0, 100);
+  const statusText = allDeep()
+    .filter(el => visible(el) && (el.tagName === 'COLAB-CONNECT-BUTTON' || el.tagName === 'MD-TEXT-BUTTON' || el.getAttribute?.('id') === 'connect'))
+    .map(el => label(el))
+    .find(txt => /RAM|Connected|已连接/i.test(txt)) || '';
   return JSON.stringify({
     ok: true,
     href: location.href,
     ready: document.readyState,
     hasGpuHint: /\b(T4|L4|A100|H100|G4|GPU|TPU)\b/i.test(body),
-    options,
+    statusText: statusText.slice(0, 200),
+    options: [],
   });
 })()
 """
@@ -4143,11 +4193,6 @@ def _runtime_connection_expression(wait_seconds: int) -> str:
     const kernel = notebook?.kernel || notebook?.getKernel?.();
     const runtime = kernel?.runtime;
     const terminalConnection = kernel?.terminalConnection || kernel?.getTerminalConnection?.();
-    const relevant = allDeep()
-      .filter(el => visible(el))
-      .map(el => ({{ tag: el.tagName, role: el.getAttribute?.('role') || null, text: label(el).slice(0, 180) }}))
-      .filter(item => /Connect|Reconnect|runtime|运行时|连接|重新连接|GPU|TPU/i.test(item.text))
-      .slice(0, 80);
     return {{
       href: location.href,
       ready: document.readyState,
@@ -4159,7 +4204,6 @@ def _runtime_connection_expression(wait_seconds: int) -> str:
       hasTerminalConnection: Boolean(terminalConnection),
       terminalReady: Boolean(runtime && (kernel?.createTerminalSocket || terminalConnection)),
       kernelLastConnectedTimeMs: notebook?.kernelLastConnectedTimeMs ?? null,
-      relevant,
     }};
   }}
   function candidateScore(el, needle) {{
@@ -4409,15 +4453,9 @@ def _runtime_accelerator_expression(accelerator: str, apply: bool) -> str:
   }}
   function state() {{
     const body = document.body?.innerText || '';
-    const relevant = allDeep()
-      .filter(el => visible(el))
-      .map(el => ({{ tag: el.tagName, role: el.getAttribute?.('role') || null, text: label(el).slice(0, 180), checked: Boolean(el.checked) }}))
-      .filter(item => /Runtime type|Hardware accelerator|CPU|GPU|TPU|Save|Apply|Restart|\u8fd0\u884c\u65f6|\u786c\u4ef6\u52a0\u901f|\u4fdd\u5b58|\u91cd\u542f/i.test(item.text))
-      .slice(0, 100);
     return {{
       href: location.href,
       hasGpuHint: /\b(T4|L4|A100|H100|G4|GPU|TPU)\b/i.test(body),
-      relevant,
     }};
   }}
   function closeMenusAndDialogs() {{

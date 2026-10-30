@@ -1323,13 +1323,13 @@ class TestLocalFileTransfer:
             )
         )
 
-        # 1. 默认调用：只保留最新 20 行，且默认不返回冗余的 outputs 与 chunks
+        # 1. 默认调用：只保留最新 20 行，带真实行号且默认不返回冗余的 outputs 与 chunks
         result = await tool.run({"cellIds": ["c1"]})
         assert result.structured_content["totalLines"]["c1"] == 50
         assert result.structured_content["returnedLines"]["c1"] == 20
         tail_text = result.structured_content["tailText"]["c1"]
-        assert "line 49" in tail_text
-        assert "line 30" in tail_text
+        assert "50: line 49" in tail_text
+        assert "31: line 30" in tail_text
         assert "line 29" not in tail_text
         assert len(tail_text.splitlines()) == 20
         assert "outputs" not in result.structured_content
@@ -1337,18 +1337,20 @@ class TestLocalFileTransfer:
         assert '"outputs":' not in result.content[0].text
         assert '"chunks":' not in result.content[0].text
 
-        # 2. 自定义 lines=5
+        # 2. 自定义 lines=5，行号从 46 到 50
         result_5 = await tool.run({"cellIds": ["c1"], "lines": 5})
         assert result_5.structured_content["returnedLines"]["c1"] == 5
         tail_5 = result_5.structured_content["tailText"]["c1"]
-        assert "line 45" in tail_5
+        assert "50: line 49" in tail_5
+        assert "46: line 45" in tail_5
         assert "line 44" not in tail_5
         assert len(tail_5.splitlines()) == 5
 
-        # 3. 指定 lines=0 返回全部行
+        # 3. 指定 lines=0 返回全部行，行号从 1 到 50
         result_all = await tool.run({"cellIds": ["c1"], "lines": 0})
         assert result_all.structured_content["returnedLines"]["c1"] == 50
-        assert "line 0" in result_all.structured_content["tailText"]["c1"]
+        assert "1: line 0" in result_all.structured_content["tailText"]["c1"]
+        assert "50: line 49" in result_all.structured_content["tailText"]["c1"]
 
         # 4. 显式开启 includeRaw 与 normalize
         result_raw = await tool.run(
@@ -1358,3 +1360,38 @@ class TestLocalFileTransfer:
         assert "chunks" in result_raw.structured_content
         assert '"outputs":' in result_raw.content[0].text
         assert '"chunks":' in result_raw.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_read_cell_outputs_strips_ansi_and_truncates_long_lines(
+        self, mock_proxy_client
+    ):
+        tool = management_tool(mock_proxy_client, "read_cell_outputs")
+        ansi_text = "\x1b[35mTraceback\x1b[0m: \x1b[31mError\x1b[0m\n"
+        huge_line = "A" * 5000 + "\n"
+        tool._call_colab = AsyncMock(
+            return_value=tool_result(
+                {
+                    "cells": [
+                        {
+                            "id": "c1",
+                            "outputs": [
+                                {
+                                    "output_type": "stream",
+                                    "text": ansi_text + huge_line,
+                                }
+                            ],
+                        }
+                    ]
+                }
+            )
+        )
+
+        result = await tool.run({"cellIds": ["c1"], "maxLineChars": 200})
+        tail_text = result.structured_content["tailText"]["c1"]
+        # ANSI 控制符应被完全剥离
+        assert "\x1b[" not in tail_text
+        assert "Traceback: Error" in tail_text
+        # 超长行应被优雅折叠截断
+        assert "A" * 250 not in tail_text
+        assert "[truncated" in tail_text
+        assert "chars]" in tail_text

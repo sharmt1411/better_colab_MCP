@@ -30,7 +30,8 @@ This fork builds upon the open-source baseline and addresses critical production
    - **Fully Automated Experience**: Replaced misleading manual authorization prompts (`Waiting for user to connect`) with clear automated status messages.
 
 2. **📉 Token-Optimized Logging**
-   - **Tailed Output**: `read_cell_outputs` defaults to returning the latest 20 lines, preventing massive progress bars from blowing up the context window.
+   - **Line Numbers & Recommended 20 Lines**: `read_cell_outputs` returns clean outputs formatted with line numbers (`123: log`) for pinpoint error location. Recommended to start by reading the latest 20 lines.
+   - **ANSI Stripping & Runaway Line Protection**: Automatically strips terminal ANSI color escape codes (eliminating `\u001b[35m` garbage) and gracefully folds single lines over 1000 characters (e.g. giant state dicts/lists).
    - **Triple Payload Deduplication**: Eliminated redundant representations (`outputs`, `tailText`, `chunks` duplicate logging), defaulting to clean, streamlined `tailText` and **reducing token consumption by ~70%**. Raw Jupyter objects remain available on-demand with `includeRaw=true`.
 
 3. **🎯 Precise Code & Environment Control**
@@ -60,7 +61,7 @@ In practice, **we strongly recommend enabling only the 16 core tools below**, le
 | | `patch_cell` | **Recommended**: Surgical search-and-replace modification |
 | **Execution & Output** | `run_code_cell` | Execute a single code cell safely |
 | | `cancel_queued_cells` | Cancel running or queued cells |
-| | `read_cell_outputs` | **Recommended**: Inspect tailed execution logs (default 20 lines) |
+| | `read_cell_outputs` | **Recommended**: Inspect tailed execution logs with line numbers (e.g. 123: log, recommended: 20 lines) |
 | **Universal Shell** | `run_shell_command` | Execute Linux commands (pip install, file checks, bash scripts) |
 
 > **Why disable the other 30+ tools?**
