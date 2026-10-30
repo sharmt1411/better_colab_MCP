@@ -45,7 +45,7 @@ from websockets.sync.client import connect as websocket_connect
 
 from colab_mcp.websocket_server import ColabWebSocketServer, COLAB, SCRATCH_PATH
 
-UI_CONNECTION_TIMEOUT = 90.0  # secs
+UI_CONNECTION_TIMEOUT = 25.0  # secs
 
 FE_CONNECTED_KEY = "fe_connected"
 PROXY_TOKEN_KEY = "proxy_token"
@@ -1051,7 +1051,8 @@ class ColabProxyClient:
     def is_connected(self):
         return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
 
-    async def await_proxy_connection(self):
+    async def await_proxy_connection(self, timeout: float | None = None):
+        wait_timeout = timeout if timeout is not None else UI_CONNECTION_TIMEOUT
         with contextlib.suppress(asyncio.TimeoutError):
             # wait for the connection to be live and for the proxy client to fully initialize
             connection_tasks = asyncio.gather(
@@ -1059,7 +1060,7 @@ class ColabProxyClient:
             )
             await asyncio.wait_for(
                 connection_tasks,
-                timeout=UI_CONNECTION_TIMEOUT,
+                timeout=wait_timeout,
             )
 
     def client_factory(self):
@@ -3127,9 +3128,9 @@ class ColabProxyMiddleware(Middleware):
         await context.fastmcp_context.report_progress(
             progress=2,
             total=3,
-            message="Connecting automatically to Colab session via browser automation (waiting up to 60s)...",
+            message="Waiting for Colab WebSocket handshake to complete (waiting up to 10s)...",
         )
-        await self.proxy_client.await_proxy_connection()
+        await self.proxy_client.await_proxy_connection(timeout=10.0)
         if self.proxy_client.is_connected():
             await context.fastmcp_context.report_progress(
                 progress=3, total=3, message="The Colab UI is successfully connected!"
@@ -3173,6 +3174,29 @@ def resolve_notebook_url(notebook_url: str | None = None) -> str:
     return url
 
 
+def _is_target_tab_already_active(target_clean: str) -> bool:
+    port = os.environ.get(EDGE_CDP_PORT_ENV, DEFAULT_EDGE_CDP_PORT)
+    url_contains = os.environ.get(
+        EDGE_CDP_URL_CONTAINS_ENV, "colab.research.google.com"
+    )
+    try:
+        if not _cdp_alive(port):
+            return False
+        pages = [
+            tab
+            for tab in _cdp_json(f"http://127.0.0.1:{port}/json/list")
+            if tab.get("type") == "page"
+        ]
+        candidates = [tab for tab in pages if url_contains in tab.get("url", "")]
+        for tab in candidates:
+            tab_base = tab.get("url", "").split("#")[0].split("?")[0]
+            if target_clean in tab_base or tab_base in target_clean:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 async def check_session_proxy_tool_fn(
     ctx: Context = CurrentContext(),
     notebook_url: str | None = None,
@@ -3180,13 +3204,34 @@ async def check_session_proxy_tool_fn(
     fe_connected = ctx.get_state(FE_CONNECTED_KEY)
     token = ctx.get_state(PROXY_TOKEN_KEY)
     port = ctx.get_state(PROXY_PORT_KEY)
+    active_url = get_active_notebook_url()
+    target_url_str = notebook_url or active_url
+    base_url = resolve_notebook_url(target_url_str)
+
+    if fe_connected:
+        target_clean = base_url.split("#")[0].split("?")[0]
+        active_clean = (
+            resolve_notebook_url(active_url).split("#")[0].split("?")[0]
+            if active_url
+            else None
+        )
+        if not notebook_url or (active_clean and target_clean == active_clean):
+            if notebook_url:
+                set_active_notebook_url(notebook_url)
+            logging.info(
+                "open_colab_browser_connection is already connected to target notebook; returning True (idempotent)."
+            )
+            return True
+        if _is_target_tab_already_active(target_clean):
+            set_active_notebook_url(notebook_url)
+            logging.info(
+                "open_colab_browser_connection: active browser tab already matches target notebook; returning True (idempotent)."
+            )
+            return True
+
     if notebook_url:
         set_active_notebook_url(notebook_url)
-    target_url_str = notebook_url or get_active_notebook_url()
-    base_url = resolve_notebook_url(target_url_str)
     url = f"{base_url}#mcpProxyToken={token}&mcpProxyPort={port}"
-    if fe_connected and not notebook_url:
-        return True
     return _navigate_controlled_edge(url, token=token, mcp_port=port)
 
 
@@ -4529,9 +4574,9 @@ def _connect_colab_tab(
 
 
 def _perform_colab_tab_connection(
-    websocket_url: str, url: str, token: str, mcp_port: str
+    websocket_url: str, url: str, token: str, mcp_port: str, *, timeout: float = 20.0
 ) -> bool:
-    deadline = time.monotonic() + UI_CONNECTION_TIMEOUT
+    deadline = time.monotonic() + timeout
     last_ready = None
     while time.monotonic() < deadline:
         try:
@@ -4566,21 +4611,26 @@ def _perform_colab_tab_connection(
         f"const targetPort={target_port};"
         f"const targetUrl={target_url};"
         "const before={connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href};"
-        "const mismatch=before.token!==targetToken||before.port!==targetPort||!location.hash.includes(targetToken)||!location.hash.includes(targetPort);"
+        "const tokenChanged=Boolean(before.token&&before.token!==targetToken);"
+        "const portChanged=Boolean(before.port&&String(before.port)!==String(targetPort));"
+        "const mismatch=tokenChanged||portChanged;"
+        "if(svc.isConnected?.()&&!mismatch){"
+        "sessionStorage.setItem('mcp_proxy_token',targetToken);"
+        "sessionStorage.setItem('mcp_proxy_port',targetPort);"
+        "return JSON.stringify({ok:true,before,mismatch:false,alreadyConnected:true,connected:true,token:targetToken,port:targetPort,href:location.href});"
+        "}"
         "if(mismatch&&svc.disconnect){try{await svc.disconnect();}catch(e){}}"
         "if(!svc.isConnected?.()&&svc.colabMcpServer?.closeServer){try{await svc.colabMcpServer.closeServer();}catch(e){}}"
         "sessionStorage.setItem('mcp_proxy_token',targetToken);"
         "sessionStorage.setItem('mcp_proxy_port',targetPort);"
         "history.replaceState(null,'',targetUrl);"
         "let alreadyConnected=false;"
-        "if(!(svc.isConnected?.()&&!mismatch)){"
         "try{await Promise.race([svc.connect(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('localColabMcpService.connect timed out')),20000))]);}"
         "catch(e){"
         "const msg=String(e?.message||e||'');"
         "if(msg.includes('MCP server already connected')&&svc.isConnected?.()){alreadyConnected=true;}"
         "else{throw e;}"
         "}"
-        "}else{alreadyConnected=true;}"
         "return JSON.stringify({ok:true,before,mismatch,alreadyConnected,connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href});"
         "})()"
     )

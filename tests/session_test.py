@@ -232,6 +232,24 @@ class TestCheckSessionProxyToolFn:
             == "https://colab.research.google.com/drive/1ABCDEFG#mcpProxyToken=test-token&mcpProxyPort=1234"
         )
 
+    @pytest.mark.asyncio
+    async def test_connected_with_same_url_is_idempotent(
+        self, mock_browser_navigation, monkeypatch
+    ):
+        ctx = Mock()
+        ctx.get_state.side_effect = (
+            lambda k: True if k == session.FE_CONNECTED_KEY else None
+        )
+        custom_url = "https://colab.research.google.com/drive/1ABCDEFG"
+        session.set_active_notebook_url(custom_url)
+
+        # 已经连接且请求相同的 notebook_url 时，应直接返回 True（幂等），不触发任何浏览器导航
+        assert (
+            await session.check_session_proxy_tool_fn(ctx=ctx, notebook_url=custom_url)
+            is True
+        )
+        mock_browser_navigation.assert_not_called()
+
 
 class TestConnectColabTabRetry:
     def test_connect_colab_tab_retry_after_5s(self, monkeypatch):

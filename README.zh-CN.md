@@ -20,6 +20,55 @@ English documentation: [README.md](README.md)
 - GPU 检查、资源快照和 GPU monitor
 - 环境变量工具，以及 runtime restart/shutdown
 
+## 🌟 本 Fork 的核心改进与特色 (Enhancements)
+
+本项目在开源基线基础上，针对 **AI 代理（LLM Agent）自动化控制 Google Colab** 的实际生产痛点，进行了多项高可用与性能重构：
+
+1. **🚀 稳定持久的会话连接（Session Resilience）**
+   - **CDP 导航防抖**：连接时智能识别目标 Notebook URL，若当前标签页已挂载则复用页面，杜绝无意义的页面重刷与会话重置。
+   - **5 秒断线自动重试**：针对 Colab 闲置休眠或瞬时网络抖动，提供 5 秒自动重试机制，大幅提升过夜挂机与长时间训练的恢复成功率。
+   - **全自动化流程体验**：消除了误导性的人工授权等待提示（Waiting for user connect），改用明确的底层状态日志，避免大模型误以为需人工介入。
+
+2. **📉 极致精简的 Token 消耗（Token-Optimized Logging）**
+   - **日志智能尾部截取**：`read_cell_outputs` 默认截取最新 20 行，避免大模型被成百上千行的进度条挤爆上下文。
+   - **Payload 三重冗余消除**：彻底移除原版中 `outputs`、`tailText`、`chunks` 三份完全重复打包的冗余设计，默认只返回精简纯文本（`tailText`），**Token 消耗立减 70%**。同时支持 `includeRaw=True` 按需提取富媒体。
+
+3. **🎯 精准的代码与环境控制**
+   - **支持指定 Notebook URL**：支持在 `open_colab_browser_connection` 中显式指定目标笔记本，杜绝被强制重定向到 scratchpad 草稿本。
+   - **高精度单元格修补（`patch_cell`）**：实现了基于搜索替换（Search-and-Replace）的高精度代码修补，无需重写整个单元格。
+   - **无限制文件传输**：移除了本地文件路径白名单限制，支持本地任意合法路径与 Colab 间的文件自由同步。
+
+## 💡 推荐开启的核心工具（16 Tools，其余按需开启）
+
+Colab MCP 提供了 50+ 个细粒度工具，如果全量开启，**每个轮次的 System Prompt 都会被注入大量重复的 Tool Schema，严重浪费 Token 且易引发模型决策犹豫与幻觉**。
+
+经过实战检验，**强烈建议在客户端仅启用以下 16 个核心工具**（满足 99% 的日常交互与挂机训练），其余高级工具按需启用：
+
+| 类别 | 推荐启用的核心工具 | 核心职责与说明 |
+| :--- | :--- | :--- |
+| **连接与初始化** | `open_colab_browser_connection` | 挂载/打开浏览器与 CDP 调试通道 |
+| | `connect_runtime` | 显式连接并初始化 Colab Python 计算实例 |
+| | `check_runtime` | 检查 Python 运行时是否就绪、环境包信息 |
+| **生命周期管理** | `restart_runtime` | 重启 Python 运行时（快速释放显存/内存） |
+| | `shutdown_runtime` | 训练/任务完成后彻底释放 Colab 实例（避免资源浪费） |
+| **硬件状态** | `check_gpu` | 检查当前分配的 GPU 状态与可用性 |
+| **单元格增删改** | `get_cells` | 获取 Notebook 完整结构及所有 Cell ID |
+| | `add_code_cell` | 创建新的 Python 代码单元格 |
+| | `add_text_cell` | 创建新的 Markdown 说明单元格 |
+| | `delete_cell` | 删除冗余/无用的单元格 |
+| | `update_cell` | 全量更新单元格代码 |
+| | `patch_cell` | **核心推荐**：通过 Search-and-Replace 局部精确修补代码 |
+| **代码执行与控制** | `run_code_cell` | 执行指定的代码单元格 |
+| | `cancel_queued_cells` | 取消排队中或卡死的代码执行队列 |
+| | `read_cell_outputs` | **核心推荐**：读取单元格最新执行日志（默认 20 行精简纯文本） |
+| **万能终端与文件** | `run_shell_command` | 执行 Linux 终端命令（pip 安装、文件查看、系统命令等） |
+
+> **为什么建议关闭其他 30+ 个工具？**
+> 1. **功能重叠**：`run_code_cells`、`run_cell_range`、`run_all_cells` 容易造成批量级联错误，逐个调用 `run_code_cell` 粒度更可控；`get_cell` / `find_cells` 完全能被 `get_cells` 代替。
+> 2. **Shell 万能替代**：文件操作（`list_files`、`make_directory`、`delete_file`、`stat_file`）以及环境变量（`set_env_vars`、`load_env_file`），在 `run_shell_command` 中通过常规 Linux 命令（`ls`, `mkdir`, `rm`, `export`）更加灵活直接，完全无需专用 MCP 工具常驻上下文。
+> 3. **极简上下文**：将工具数从 50+ 精简至 16 个，每次对话可直接**节约数千 Token**，模型响应更快、出错率更低。
+
+
 ## 项目结构
 
 - `src/colab_mcp/`: Python MCP 服务、Colab session proxy、runtime/browser 工具。

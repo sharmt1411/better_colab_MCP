@@ -20,6 +20,55 @@ This fork extends the upstream static Colab MCP baseline with:
 - GPU checks, snapshots, and monitor jobs
 - environment variable helpers and runtime restart/shutdown tools
 
+## 🌟 Key Enhancements & Differences from Upstream
+
+This fork builds upon the open-source baseline and addresses critical production issues encountered when using **AI Agents to control Google Colab**:
+
+1. **🚀 Session Resilience & Automation**
+   - **CDP Navigation Debounce**: Intelligently identifies the target notebook URL. If already active, it reuses the tab without redundant reloads, preventing session drops.
+   - **5s Automatic Retry**: Implements an automatic 5-second retry loop on initial connection failures, significantly boosting overnight and long-running job recovery.
+   - **Fully Automated Experience**: Replaced misleading manual authorization prompts (`Waiting for user to connect`) with clear automated status messages.
+
+2. **📉 Token-Optimized Logging**
+   - **Tailed Output**: `read_cell_outputs` defaults to returning the latest 20 lines, preventing massive progress bars from blowing up the context window.
+   - **Triple Payload Deduplication**: Eliminated redundant representations (`outputs`, `tailText`, `chunks` duplicate logging), defaulting to clean, streamlined `tailText` and **reducing token consumption by ~70%**. Raw Jupyter objects remain available on-demand with `includeRaw=true`.
+
+3. **🎯 Precise Code & Environment Control**
+   - **Target Notebook URL Support**: Allows binding to specific notebook URLs directly via `open_colab_browser_connection`, preventing unwanted redirects to scratchpads.
+   - **Search-and-Replace Cell Patching**: Enhanced `patch_cell` with accurate search-and-replace mechanics rather than fragile line-based replacements.
+   - **Unrestricted Local File Paths**: Removed arbitrary local path restrictions, allowing seamless file transfers across any local directory and Colab.
+
+## 💡 Recommended Core Tools (16 Tools — Enable Others on Demand)
+
+Colab MCP defines over 50 tools. Enabling all of them simultaneously injects excessive schemas into the system prompt on every turn, consuming thousands of tokens and increasing model decision friction.
+
+In practice, **we strongly recommend enabling only the 16 core tools below**, leaving secondary tools disabled unless specifically required:
+
+| Category | Recommended Core Tool | Purpose |
+| :--- | :--- | :--- |
+| **Connection & Setup** | `open_colab_browser_connection` | Mount/open browser tab and CDP debug port |
+| | `connect_runtime` | Initialize Colab Python compute runtime |
+| | `check_runtime` | Verify Python runtime health & environment packages |
+| **Lifecycle** | `restart_runtime` | Restart Python runtime (release GPU VRAM / memory) |
+| | `shutdown_runtime` | Fully release Colab instance after training/tasks |
+| **Hardware** | `check_gpu` | Check active GPU model and availability |
+| **Notebook Authoring** | `get_cells` | Inspect full notebook structure and all cell IDs |
+| | `add_code_cell` | Add new Python code cell |
+| | `add_text_cell` | Add new Markdown text cell |
+| | `delete_cell` | Remove unwanted cells |
+| | `update_cell` | Full update of cell source |
+| | `patch_cell` | **Recommended**: Surgical search-and-replace modification |
+| **Execution & Output** | `run_code_cell` | Execute a single code cell safely |
+| | `cancel_queued_cells` | Cancel running or queued cells |
+| | `read_cell_outputs` | **Recommended**: Inspect tailed execution logs (default 20 lines) |
+| **Universal Shell** | `run_shell_command` | Execute Linux commands (pip install, file checks, bash scripts) |
+
+> **Why disable the other 30+ tools?**
+> 1. **Redundancy**: Batch operations (`run_all_cells`, `run_cell_range`) can cause cascading failures; granular execution via `run_code_cell` is much safer for AI agents. `get_cells` already covers single cell lookups.
+> 2. **Shell Versatility**: Dedicated file tools (`list_files`, `make_directory`, `delete_file`) and environment tools (`set_env_vars`) are effortlessly handled with standard Linux commands via `run_shell_command` (`ls`, `mkdir`, `rm`, `export`).
+> 3. **Token Efficiency**: Pruning 50+ tools down to 16 **saves thousands of system prompt tokens** per turn, reduces hallucination, and speeds up agent response time.
+
+
 ## Project Layout
 
 - `src/colab_mcp/`: Python MCP server, Colab session proxy, runtime/browser tools.
