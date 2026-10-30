@@ -311,8 +311,16 @@ def command_connect(args: argparse.Namespace) -> None:
         )
     start_edge(args.port, args.profile, scratch_url)
     tab = create_or_get_colab_tab(args.port, scratch_url)
-    with CdpSession(tab["webSocketDebuggerUrl"]) as cdp:
-        cdp.call("Page.navigate", {"url": scratch_url})
+    current_tab_url = tab.get("url", "")
+    current_base = current_tab_url.split("#")[0].split("?")[0]
+    target_clean = scratch_url.split("#")[0].split("?")[0]
+    same_notebook = (current_base == target_clean) or (
+        target_clean.endswith("empty.ipynb") and COLAB_URL_FRAGMENT in current_base
+    )
+    if not same_notebook:
+        with CdpSession(tab["webSocketDebuggerUrl"]) as cdp:
+            cdp.call("Page.navigate", {"url": scratch_url})
+        time.sleep(0.5)
     deadline = time.monotonic() + args.timeout
     last = None
     while time.monotonic() < deadline:
@@ -354,6 +362,7 @@ def command_connect(args: argparse.Namespace) -> None:
         "const before={connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href};"
         "const mismatch=before.token!==targetToken||before.port!==targetPort||!location.hash.includes(targetToken)||!location.hash.includes(targetPort);"
         "if(mismatch&&svc.disconnect){try{await svc.disconnect();}catch(e){}}"
+        "if(!svc.isConnected?.()&&svc.colabMcpServer?.closeServer){try{await svc.colabMcpServer.closeServer();}catch(e){}}"
         "sessionStorage.setItem('mcp_proxy_token',targetToken);"
         "sessionStorage.setItem('mcp_proxy_port',targetPort);"
         "const base=location.href.split('#')[0];"
@@ -369,6 +378,17 @@ def command_connect(args: argparse.Namespace) -> None:
         "})()"
     )
     evaluation = eval_colab(args.port, connect_js, await_promise=True)
+    val = evaluation.get("result", {}).get("value")
+    success = False
+    if "exceptionDetails" not in evaluation and isinstance(val, str):
+        with contextlib.suppress(Exception):
+            parsed = json.loads(val)
+            if parsed.get("ok") and parsed.get("connected"):
+                success = True
+
+    if not success:
+        time.sleep(5)
+        evaluation = eval_colab(args.port, connect_js, await_promise=True)
     if "exceptionDetails" in evaluation:
         raise RuntimeError(
             "Colab connect JavaScript failed: "

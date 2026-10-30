@@ -628,12 +628,30 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
         "parameters": {
             "type": "object",
             "properties": {
-                "cellId": {"type": "string", "description": "The ID of the cell to update."},
-                "target": {"type": "string", "description": "The exact string to find and replace in the cell."},
-                "replacement": {"type": "string", "description": "The string to replace the target with (defaults to empty string)."},
-                "count": {"type": "integer", "description": "Number of occurrences to replace. Defaults to -1 (replace all)."},
-                "source": {"type": "string", "description": "Full cell source content (for backward compatibility)."},
-                "content": {"type": "string", "description": "Full cell content (alias for source)."},
+                "cellId": {
+                    "type": "string",
+                    "description": "The ID of the cell to update.",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "The exact string to find and replace in the cell.",
+                },
+                "replacement": {
+                    "type": "string",
+                    "description": "The string to replace the target with (defaults to empty string).",
+                },
+                "count": {
+                    "type": "integer",
+                    "description": "Number of occurrences to replace. Defaults to -1 (replace all).",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Full cell source content (for backward compatibility).",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "Full cell content (alias for source).",
+                },
             },
             "required": ["cellId"],
             "additionalProperties": False,
@@ -1249,14 +1267,10 @@ class ColabRuntimeManagementTool(Tool):
         Tails chunks so that total lines across all chunks is at most `lines`.
         Returns (tailed_chunks, joined_tail_text, total_lines_before_tail).
         """
-        all_chunk_lines = [
-            chunk.get("text", "").splitlines() for chunk in chunks
-        ]
+        all_chunk_lines = [chunk.get("text", "").splitlines() for chunk in chunks]
         total_lines = sum(len(cl) for cl in all_chunk_lines)
         if lines is None or lines <= 0 or total_lines <= lines:
-            joined = "\n".join(
-                line for cl in all_chunk_lines for line in cl
-            )
+            joined = "\n".join(line for cl in all_chunk_lines for line in cl)
             return chunks, joined, total_lines
 
         remaining = lines
@@ -1277,9 +1291,7 @@ class ColabRuntimeManagementTool(Tool):
 
         tailed.reverse()
         joined = "\n".join(
-            line
-            for chunk in tailed
-            for line in chunk.get("text", "").splitlines()
+            line for chunk in tailed for line in chunk.get("text", "").splitlines()
         )
         return tailed, joined, total_lines
 
@@ -1310,21 +1322,21 @@ class ColabRuntimeManagementTool(Tool):
             return ["\n"]
 
         op_lines = [get_lines(op) for op in outputs]
-        total = sum(len(l) for l in op_lines)
+        total = sum(len(lines_item) for lines_item in op_lines)
         if total <= lines:
             return outputs
 
         remaining = lines
         tailed = []
-        for op, l in zip(reversed(outputs), reversed(op_lines)):
+        for op, lines_item in zip(reversed(outputs), reversed(op_lines)):
             if remaining <= 0:
                 break
-            if len(l) <= remaining:
+            if len(lines_item) <= remaining:
                 tailed.append(op)
-                remaining -= len(l)
+                remaining -= len(lines_item)
             else:
                 new_op = dict(op)
-                tailed_l = l[-remaining:]
+                tailed_l = lines_item[-remaining:]
                 if "text" in new_op:
                     new_op["text"] = (
                         "".join(tailed_l)
@@ -1937,7 +1949,9 @@ class ColabRuntimeManagementTool(Tool):
                 replacement = arguments.get("replacement", "")
                 count = arguments.get("count", -1)
 
-                cells_result = await self._call_colab("get_cells", {"includeOutputs": False})
+                cells_result = await self._call_colab(
+                    "get_cells", {"includeOutputs": False}
+                )
                 cells = json.loads(self._result_text(cells_result)).get("cells", [])
                 cell = next((c for c in cells if c.get("id") == cell_id), None)
                 if cell is None:
@@ -1972,7 +1986,9 @@ class ColabRuntimeManagementTool(Tool):
 
             content = arguments.get("source", arguments.get("content"))
             if content is None:
-                raise ValueError("patch_cell requires target (and optional replacement) or source or content")
+                raise ValueError(
+                    "patch_cell requires target (and optional replacement) or source or content"
+                )
             result = await self._call_colab(
                 "update_cell",
                 {"cellId": cell_id, "content": content},
@@ -3076,12 +3092,12 @@ class ColabProxyMiddleware(Middleware):
             return result
         # if the tool call was for open_colab_browser_connection and there is no existing connection, try to await full connection
         await context.fastmcp_context.report_progress(
-            progress=1, total=3, message="The user is not connected to the Colab UI"
+            progress=1, total=3, message="Colab UI session is not yet connected"
         )
         await context.fastmcp_context.report_progress(
             progress=2,
             total=3,
-            message="Waiting for user to connect in Colab - will wait for 60s",
+            message="Connecting automatically to Colab session via browser automation (waiting up to 60s)...",
         )
         await self.proxy_client.await_proxy_connection()
         if self.proxy_client.is_connected():
@@ -3096,7 +3112,7 @@ class ColabProxyMiddleware(Middleware):
             await context.fastmcp_context.report_progress(
                 progress=3,
                 total=3,
-                message="Timeout while waiting for the user to connect.",
+                message="Automated connection to Colab timed out.",
             )
             return ToolResult(
                 content=[TextContent(type="text", text="false")],
@@ -4136,6 +4152,9 @@ def _runtime_connection_expression(wait_seconds: int) -> str:
   async function connectLocalMcp() {{
     const service = window.colab?.global?.notebook?.localColabMcpService;
     if (!service?.isConnected?.() && service?.connect) {{
+      if (service.colabMcpServer?.closeServer) {{
+        try {{ await service.colabMcpServer.closeServer(); }} catch (e) {{}}
+      }}
       await Promise.race([
         service.connect(),
         new Promise((_, reject) => setTimeout(() => reject(new Error('localColabMcpService.connect timed out')), 20000)),
@@ -4164,7 +4183,13 @@ def _runtime_connection_expression(wait_seconds: int) -> str:
       await connectLocalMcp();
       await sleep(1000);
     }} catch (error) {{
-      out.warnings.push(`Local MCP reconnect attempt failed: ${{String(error?.message || error)}}`);
+      await sleep(5000);
+      try {{
+        await connectLocalMcp();
+        await sleep(1000);
+      }} catch (err2) {{
+        out.warnings.push(`Local MCP reconnect attempt failed: ${{String(err2?.message || err2)}}`);
+      }}
     }}
   }}
   out.localMcpDialogClosed = await closeLocalMcpDialog();
@@ -4428,17 +4453,54 @@ def _navigate_controlled_edge(
                 target["webSocketDebuggerUrl"], url, str(token), str(mcp_port)
             )
         _cdp_request(f"http://127.0.0.1:{port}/json/activate/{target['id']}")
-        _edge_cdp_call(target["webSocketDebuggerUrl"], "Page.navigate", {"url": url})
+
+        target_tab_url = target.get("url", "")
+        current_base = target_tab_url.split("#")[0].split("?")[0]
+        same_page = (current_base == clean_url) or (
+            clean_url.endswith("empty.ipynb") and url_contains in current_base
+        )
+        if not same_page:
+            _edge_cdp_call(
+                target["webSocketDebuggerUrl"], "Page.navigate", {"url": url}
+            )
+            time.sleep(0.5)
+
         if token is not None and mcp_port is not None:
             return _connect_colab_tab(
                 target["webSocketDebuggerUrl"], url, str(token), str(mcp_port)
             )
         return True
-    except Exception:
+    except Exception as exc:
+        logging.exception("Failed in _navigate_controlled_edge: %s", exc)
         return False
 
 
-def _connect_colab_tab(websocket_url: str, url: str, token: str, mcp_port: str) -> bool:
+def _connect_colab_tab(
+    websocket_url: str,
+    url: str,
+    token: str,
+    mcp_port: str,
+    *,
+    retries: int = 1,
+    retry_delay: float = 5.0,
+) -> bool:
+    for attempt in range(retries + 1):
+        if attempt > 0:
+            logging.info(
+                "Colab tab connect attempt failed, waiting %.1fs before retrying (attempt %d/%d)...",
+                retry_delay,
+                attempt,
+                retries,
+            )
+            time.sleep(retry_delay)
+        if _perform_colab_tab_connection(websocket_url, url, token, mcp_port):
+            return True
+    return False
+
+
+def _perform_colab_tab_connection(
+    websocket_url: str, url: str, token: str, mcp_port: str
+) -> bool:
     deadline = time.monotonic() + UI_CONNECTION_TIMEOUT
     last_ready = None
     while time.monotonic() < deadline:
@@ -4476,6 +4538,7 @@ def _connect_colab_tab(websocket_url: str, url: str, token: str, mcp_port: str) 
         "const before={connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href};"
         "const mismatch=before.token!==targetToken||before.port!==targetPort||!location.hash.includes(targetToken)||!location.hash.includes(targetPort);"
         "if(mismatch&&svc.disconnect){try{await svc.disconnect();}catch(e){}}"
+        "if(!svc.isConnected?.()&&svc.colabMcpServer?.closeServer){try{await svc.colabMcpServer.closeServer();}catch(e){}}"
         "sessionStorage.setItem('mcp_proxy_token',targetToken);"
         "sessionStorage.setItem('mcp_proxy_port',targetPort);"
         "history.replaceState(null,'',targetUrl);"
@@ -4491,7 +4554,10 @@ def _connect_colab_tab(websocket_url: str, url: str, token: str, mcp_port: str) 
         "return JSON.stringify({ok:true,before,mismatch,alreadyConnected,connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href});"
         "})()"
     )
-    evaluation = _edge_cdp_eval(websocket_url, expression, await_promise=True)
+    try:
+        evaluation = _edge_cdp_eval(websocket_url, expression, await_promise=True)
+    except Exception:
+        return False
     if "exceptionDetails" in evaluation:
         return False
     value = evaluation.get("result", {}).get("value")
@@ -4538,9 +4604,10 @@ check_session_proxy_tool = Tool.from_function(
     fn=check_session_proxy_tool_fn,
     name=INJECTED_TOOL_NAME,
     description=(
-        "Opens a connection to a Google Colab browser session and unlocks notebook editing tools. "
+        "Automatically connects to a Google Colab browser session via local browser automation and unlocks notebook editing tools. "
+        "The connection is fully automated; NO user interaction or manual confirmation in the browser is needed. "
         "Optionally accepts a 'notebook_url' (e.g. https://colab.research.google.com/drive/xxx) "
-        "to open an existing notebook instead of an empty scratchpad. "
+        "to open/connect an existing notebook instead of an empty scratchpad. "
         "Returns a boolean representing whether the connection attempt succeeded."
     ),
 )

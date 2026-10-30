@@ -19,6 +19,8 @@ from fastmcp.server.middleware import MiddlewareContext
 import pytest
 from unittest.mock import patch, AsyncMock, Mock
 
+ORIGINAL_NAVIGATE_CONTROLLED_EDGE = session._navigate_controlled_edge
+
 
 @pytest.fixture(autouse=True)
 def mock_browser_navigation(monkeypatch):
@@ -229,6 +231,101 @@ class TestCheckSessionProxyToolFn:
             args[0]
             == "https://colab.research.google.com/drive/1ABCDEFG#mcpProxyToken=test-token&mcpProxyPort=1234"
         )
+
+
+class TestConnectColabTabRetry:
+    def test_connect_colab_tab_retry_after_5s(self, monkeypatch):
+        mock_perform = Mock(side_effect=[False, True])
+        mock_sleep = Mock()
+        monkeypatch.setattr(session, "_perform_colab_tab_connection", mock_perform)
+        monkeypatch.setattr(session.time, "sleep", mock_sleep)
+
+        res = session._connect_colab_tab(
+            "ws://debugger",
+            "https://colab.research.google.com/drive/123",
+            "test_token",
+            "1234",
+            retries=1,
+            retry_delay=5.0,
+        )
+
+        assert res is True
+        assert mock_perform.call_count == 2
+        mock_sleep.assert_called_once_with(5.0)
+
+    def test_connect_colab_tab_all_failures(self, monkeypatch):
+        mock_perform = Mock(return_value=False)
+        mock_sleep = Mock()
+        monkeypatch.setattr(session, "_perform_colab_tab_connection", mock_perform)
+        monkeypatch.setattr(session.time, "sleep", mock_sleep)
+
+        res = session._connect_colab_tab(
+            "ws://debugger",
+            "https://colab.research.google.com/drive/123",
+            "test_token",
+            "1234",
+            retries=1,
+            retry_delay=5.0,
+        )
+
+        assert res is False
+        assert mock_perform.call_count == 2
+        mock_sleep.assert_called_once_with(5.0)
+
+
+class TestNavigateControlledEdgeOptimization:
+    def test_navigate_skips_reload_on_same_page(self, monkeypatch):
+        monkeypatch.setattr(
+            session, "_navigate_controlled_edge", ORIGINAL_NAVIGATE_CONTROLLED_EDGE
+        )
+        existing_tab = {
+            "id": "tab1",
+            "type": "page",
+            "url": "https://colab.research.google.com/drive/1ABCDEFG#scrollTo=something",
+            "webSocketDebuggerUrl": "ws://debugger/tab1",
+        }
+        monkeypatch.setattr(session, "_ensure_controlled_edge", Mock())
+        monkeypatch.setattr(session, "_cdp_json", Mock(return_value=[existing_tab]))
+        monkeypatch.setattr(session, "_cdp_request", Mock())
+        mock_cdp_call = Mock()
+        monkeypatch.setattr(session, "_edge_cdp_call", mock_cdp_call)
+        mock_connect = Mock(return_value=True)
+        monkeypatch.setattr(session, "_connect_colab_tab", mock_connect)
+
+        url = "https://colab.research.google.com/drive/1ABCDEFG#mcpProxyToken=tok&mcpProxyPort=123"
+        res = session._navigate_controlled_edge(url, token="tok", mcp_port="123")
+
+        assert res is True
+        mock_cdp_call.assert_not_called()
+        mock_connect.assert_called_once()
+
+    def test_navigate_performs_reload_on_different_page(self, monkeypatch):
+        monkeypatch.setattr(
+            session, "_navigate_controlled_edge", ORIGINAL_NAVIGATE_CONTROLLED_EDGE
+        )
+        existing_tab = {
+            "id": "tab1",
+            "type": "page",
+            "url": "https://colab.research.google.com/drive/OLD_NOTEBOOK",
+            "webSocketDebuggerUrl": "ws://debugger/tab1",
+        }
+        monkeypatch.setattr(session, "_ensure_controlled_edge", Mock())
+        monkeypatch.setattr(session, "_cdp_json", Mock(return_value=[existing_tab]))
+        monkeypatch.setattr(session, "_cdp_request", Mock())
+        mock_cdp_call = Mock()
+        monkeypatch.setattr(session, "_edge_cdp_call", mock_cdp_call)
+        mock_connect = Mock(return_value=True)
+        monkeypatch.setattr(session, "_connect_colab_tab", mock_connect)
+        monkeypatch.setattr(session.time, "sleep", Mock())
+
+        url = "https://colab.research.google.com/drive/NEW_NOTEBOOK#mcpProxyToken=tok&mcpProxyPort=123"
+        res = session._navigate_controlled_edge(url, token="tok", mcp_port="123")
+
+        assert res is True
+        mock_cdp_call.assert_called_once_with(
+            "ws://debugger/tab1", "Page.navigate", {"url": url}
+        )
+        mock_connect.assert_called_once()
 
 
 def test_resolve_notebook_url():
@@ -1009,12 +1106,13 @@ class TestManagementToolLogic:
                 "python": "3.13",
             }
         )
-        with patch(
-            "colab_mcp.session._evaluate_colab_page",
-            side_effect=RuntimeError("browser unavailable"),
-        ), patch(
-            "colab_mcp.session._navigate_controlled_edge"
-        ) as mock_nav:
+        with (
+            patch(
+                "colab_mcp.session._evaluate_colab_page",
+                side_effect=RuntimeError("browser unavailable"),
+            ),
+            patch("colab_mcp.session._navigate_controlled_edge") as mock_nav,
+        ):
             result = await tool.run({})
 
         mock_nav.assert_not_called()
@@ -1130,7 +1228,9 @@ class TestLocalFileTransfer:
             session._runtime_upload_local_file("", "/content/out.txt")
 
     @pytest.mark.asyncio
-    async def test_connect_runtime_does_not_navigate_when_connected(self, mock_proxy_client):
+    async def test_connect_runtime_does_not_navigate_when_connected(
+        self, mock_proxy_client
+    ):
         tool = management_tool(mock_proxy_client, "connect_runtime")
         mock_proxy_client.is_connected.return_value = True
         with (
@@ -1147,8 +1247,16 @@ class TestLocalFileTransfer:
 
     def test_colab_page_websocket_url_prefers_drive_tab(self, monkeypatch):
         tabs = [
-            {"type": "page", "url": "https://colab.research.google.com/notebooks/empty.ipynb", "webSocketDebuggerUrl": "ws://empty"},
-            {"type": "page", "url": "https://colab.research.google.com/drive/1QYf0txvcL0EA", "webSocketDebuggerUrl": "ws://drive"},
+            {
+                "type": "page",
+                "url": "https://colab.research.google.com/notebooks/empty.ipynb",
+                "webSocketDebuggerUrl": "ws://empty",
+            },
+            {
+                "type": "page",
+                "url": "https://colab.research.google.com/drive/1QYf0txvcL0EA",
+                "webSocketDebuggerUrl": "ws://drive",
+            },
         ]
         monkeypatch.setattr(session, "_cdp_json", Mock(return_value=tabs))
         session._ACTIVE_NOTEBOOK_URL = None
@@ -1157,11 +1265,21 @@ class TestLocalFileTransfer:
 
     def test_colab_page_websocket_url_prefers_active_notebook(self, monkeypatch):
         tabs = [
-            {"type": "page", "url": "https://colab.research.google.com/drive/OTHER", "webSocketDebuggerUrl": "ws://other"},
-            {"type": "page", "url": "https://colab.research.google.com/drive/TARGET_123", "webSocketDebuggerUrl": "ws://target"},
+            {
+                "type": "page",
+                "url": "https://colab.research.google.com/drive/OTHER",
+                "webSocketDebuggerUrl": "ws://other",
+            },
+            {
+                "type": "page",
+                "url": "https://colab.research.google.com/drive/TARGET_123",
+                "webSocketDebuggerUrl": "ws://target",
+            },
         ]
         monkeypatch.setattr(session, "_cdp_json", Mock(return_value=tabs))
-        session.set_active_notebook_url("https://colab.research.google.com/drive/TARGET_123")
+        session.set_active_notebook_url(
+            "https://colab.research.google.com/drive/TARGET_123"
+        )
         try:
             ws_url = session._colab_page_websocket_url()
             assert ws_url == "ws://target"
@@ -1169,7 +1287,9 @@ class TestLocalFileTransfer:
             session._ACTIVE_NOTEBOOK_URL = None
 
     @pytest.mark.asyncio
-    async def test_read_cell_outputs_defaults_to_latest_20_lines(self, mock_proxy_client):
+    async def test_read_cell_outputs_defaults_to_latest_20_lines(
+        self, mock_proxy_client
+    ):
         tool = management_tool(mock_proxy_client, "read_cell_outputs")
         fifty_lines = "\n".join(f"line {i}" for i in range(50)) + "\n"
         tool._call_colab = AsyncMock(
