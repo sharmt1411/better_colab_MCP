@@ -259,3 +259,42 @@ async def test_token_in_url_must_match_exactly():
                 origin="https://colab.google.com",
                 subprotocols=["mcp"],
             )
+
+@pytest.mark.asyncio
+async def test_reconnection_resets_streams():
+    async with ColabWebSocketServer() as server:
+        # First connection
+        client1 = await websockets.connect(
+            f"ws://localhost:{server.port}",
+            origin="https://colab.google.com",
+            subprotocols=["mcp"],
+            additional_headers={"Authorization": f"Bearer {server.token}"},
+        )
+        assert server.connection_live.is_set()
+        assert server.connection_generation == 1
+        await client1.close()
+        await asyncio.sleep(0.1)
+        assert not server.connection_live.is_set()
+
+        # Second connection (reconnect)
+        client2 = await websockets.connect(
+            f"ws://localhost:{server.port}",
+            origin="https://colab.google.com",
+            subprotocols=["mcp"],
+            additional_headers={"Authorization": f"Bearer {server.token}"},
+        )
+        assert server.connection_live.is_set()
+        assert server.connection_generation == 2
+
+        # Verify communication works on the second connection
+        test_message = JSONRPCResponse(
+            jsonrpc="2.0",
+            id="reconnect_test",
+            result={"result": "ok"},
+            additional_headers={"Authorization": f"Bearer {server.token}"},
+        )
+        await client2.send(test_message.model_dump_json())
+        received_msg = await asyncio.wait_for(server.read_stream.receive(), timeout=1)
+        assert received_msg.message == JSONRPCMessage(test_message)
+
+        await client2.close()

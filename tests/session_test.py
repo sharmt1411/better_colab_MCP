@@ -440,6 +440,33 @@ class TestColabProxyClient:
         mock_colab_transport.assert_called_once_with(mock_wss)
         mock_client.assert_called_with(mock_colab_transport.return_value)
 
+    @pytest.mark.asyncio
+    @patch("colab_mcp.session.Client")
+    @patch("colab_mcp.session.ColabTransport", spec=session.ColabTransport)
+    async def test_reconnection_lifecycle(
+        self, mock_colab_transport, mock_client, mock_wss
+    ):
+        mock_client.return_value.__aenter__ = AsyncMock()
+        client = session.ColabProxyClient(mock_wss)
+        mock_wss.connection_live.set()
+        mock_wss.connection_generation = 1
+        async with client:
+            await client._start_task
+            # Initial calls: 1 for stubbed client in __init__, 1 for proxy client in _start_proxy_client
+            assert mock_client.call_count == 2
+
+            # Simulate disconnect
+            mock_wss.connection_live.clear()
+            await asyncio.sleep(0.3)
+            assert client.is_connected() is False
+
+            # Simulate reconnect
+            mock_wss.connection_generation = 2
+            mock_wss.connection_live.set()
+            await asyncio.sleep(0.4)
+            # Reconnect creates a fresh Client instance
+            assert mock_client.call_count == 3
+
 
 class TestColabTransport:
     @pytest.mark.asyncio

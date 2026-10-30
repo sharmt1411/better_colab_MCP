@@ -78,6 +78,10 @@ def start_edge(port: int, profile: Path, url: str) -> None:
             f"--user-data-dir={profile}",
             "--no-first-run",
             "--new-window",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
             url,
         ],
         stdout=subprocess.DEVNULL,
@@ -354,35 +358,184 @@ def command_connect(args: argparse.Namespace) -> None:
     token = json.dumps(state["token"])
     mcp_port = json.dumps(str(state["port"]))
     connect_js = (
-        "(async()=>{"
-        "const svc=window.colab?.global?.notebook?.localColabMcpService;"
-        "if(!svc) return JSON.stringify({ok:false,error:'localColabMcpService missing'});"
-        f"const targetToken={token};"
-        f"const targetPort={mcp_port};"
-        "const before={connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href};"
-        "const tokenChanged=Boolean(before.token&&before.token!==targetToken);"
-        "const portChanged=Boolean(before.port&&String(before.port)!==String(targetPort));"
-        "const mismatch=tokenChanged||portChanged;"
-        "if(svc.isConnected?.()&&!mismatch){"
-        "sessionStorage.setItem('mcp_proxy_token',targetToken);"
-        "sessionStorage.setItem('mcp_proxy_port',targetPort);"
-        "return JSON.stringify({ok:true,before,mismatch:false,alreadyConnected:true,connected:svc.isConnected(),token:targetToken,port:targetPort,href:location.href});"
-        "}"
-        "if(mismatch&&svc.disconnect){try{await svc.disconnect();}catch(e){}}"
-        "if(!svc.isConnected?.()&&svc.colabMcpServer?.closeServer){try{await svc.colabMcpServer.closeServer();}catch(e){}}"
-        "sessionStorage.setItem('mcp_proxy_token',targetToken);"
-        "sessionStorage.setItem('mcp_proxy_port',targetPort);"
-        "const base=location.href.split('#')[0];"
-        "history.replaceState(null,'',`${base}#mcpProxyToken=${encodeURIComponent(targetToken)}&mcpProxyPort=${encodeURIComponent(targetPort)}`);"
-        "let alreadyConnected=false;"
-        "try{await Promise.race([svc.connect(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('localColabMcpService.connect timed out')),20000))]);}"
-        "catch(e){"
-        "const msg=String(e?.message||e||'');"
-        "if(msg.includes('MCP server already connected')&&svc.isConnected?.()){alreadyConnected=true;}"
-        "else{throw e;}"
-        "}"
-        "return JSON.stringify({ok:true, before, mismatch, alreadyConnected, connected:svc.isConnected(), token:sessionStorage.getItem('mcp_proxy_token'), port:sessionStorage.getItem('mcp_proxy_port'), href:location.href});"
-        "})()"
+        r"""(async () => {
+const svc = window.colab?.global?.notebook?.localColabMcpService;
+if (!svc) return JSON.stringify({ok: false, error: 'localColabMcpService missing'});
+const targetToken = """
+        + token
+        + r""";
+const targetPort = """
+        + mcp_port
+        + r""";
+function updateBadge(connected, statusText) {
+  try {
+    let badge = document.getElementById('colab-mcp-status-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'colab-mcp-status-badge';
+      badge.style.position = 'fixed';
+      badge.style.bottom = '12px';
+      badge.style.right = '12px';
+      badge.style.zIndex = '999999';
+      badge.style.display = 'flex';
+      badge.style.alignItems = 'center';
+      badge.style.gap = '6px';
+      badge.style.padding = '4px 10px';
+      badge.style.borderRadius = '16px';
+      badge.style.fontSize = '12px';
+      badge.style.fontFamily = 'system-ui, -apple-system, sans-serif';
+      badge.style.color = '#ffffff';
+      badge.style.backgroundColor = 'rgba(32, 33, 36, 0.88)';
+      badge.style.backdropFilter = 'blur(4px)';
+      badge.style.border = '1px solid rgba(255,255,255,0.15)';
+      badge.style.boxShadow = '0 2px 8px rgba(0,0,0,0.25)';
+      badge.style.cursor = 'pointer';
+      badge.style.userSelect = 'none';
+      badge.style.transition = 'all 0.2s ease';
+      badge.title = 'Colab 本地 MCP 连接状态（失焦保持后台连接，点击可手动触发重连）';
+      badge.onclick = async () => {
+        updateBadge(false, 'MCP: 正在手动重连...');
+        const s = window.colab?.global?.notebook?.localColabMcpService;
+        if (s && !s.isConnected?.()) {
+          try { await s.connect(); } catch (e) {}
+        }
+        updateBadge(!!s?.isConnected?.());
+      };
+      badge.innerHTML = '<span class="mcp-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#34a853;"></span><span class="mcp-text">MCP: 连接中...</span>';
+      document.body.appendChild(badge);
+    }
+    const dot = badge.querySelector('.mcp-dot');
+    const text = badge.querySelector('.mcp-text');
+    if (!dot || !text) return;
+    if (statusText) {
+      dot.style.background = '#fbbc04';
+      dot.style.boxShadow = '0 0 6px #fbbc04';
+      text.innerText = statusText;
+      badge.style.borderColor = 'rgba(251, 188, 4, 0.5)';
+    } else if (connected) {
+      dot.style.background = '#34a853';
+      dot.style.boxShadow = '0 0 6px #34a853';
+      const p = targetPort || sessionStorage.getItem('mcp_proxy_port') || '';
+      text.innerText = `MCP: 已连接 (:${p})`;
+      badge.style.borderColor = 'rgba(52, 168, 83, 0.5)';
+    } else {
+      dot.style.background = '#ea4335';
+      dot.style.boxShadow = '0 0 6px #ea4335';
+      text.innerText = 'MCP: 已断开';
+      badge.style.borderColor = 'rgba(234, 67, 53, 0.5)';
+    }
+  } catch (e) {}
+}
+
+if (!window.__colab_mcp_keepalive_installed) {
+  window.__colab_mcp_keepalive_installed = true;
+  let autoReconnecting = false;
+  const checkAndAutoReconnect = async () => {
+    const s = window.colab?.global?.notebook?.localColabMcpService;
+    if (!s) return;
+    const isConn = !!s.isConnected?.();
+    if (isConn) {
+      autoReconnecting = false;
+      updateBadge(true);
+      return;
+    }
+    if (!autoReconnecting) {
+      autoReconnecting = true;
+      updateBadge(false, 'MCP: 正在自动重连...');
+      try {
+        const t = sessionStorage.getItem('mcp_proxy_token');
+        const p = sessionStorage.getItem('mcp_proxy_port');
+        if (t && p) {
+          if (s.colabMcpServer?.closeServer) {
+            try { await s.colabMcpServer.closeServer(); } catch (e) {}
+          }
+          await Promise.race([
+            s.connect(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('auto-reconnect timeout')), 15000))
+          ]);
+        }
+      } catch (err) {
+      } finally {
+        autoReconnecting = false;
+        updateBadge(!!s.isConnected?.());
+      }
+    }
+  };
+  setInterval(checkAndAutoReconnect, 4000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      checkAndAutoReconnect();
+    }
+  });
+}
+
+const before = {
+  connected: svc.isConnected?.(),
+  token: sessionStorage.getItem('mcp_proxy_token'),
+  port: sessionStorage.getItem('mcp_proxy_port'),
+  href: location.href
+};
+const tokenChanged = Boolean(before.token && before.token !== targetToken);
+const portChanged = Boolean(before.port && String(before.port) !== String(targetPort));
+const mismatch = tokenChanged || portChanged;
+
+if (svc.isConnected?.() && !mismatch) {
+  sessionStorage.setItem('mcp_proxy_token', targetToken);
+  sessionStorage.setItem('mcp_proxy_port', targetPort);
+  updateBadge(true);
+  return JSON.stringify({
+    ok: true,
+    before,
+    mismatch: false,
+    alreadyConnected: true,
+    connected: true,
+    token: targetToken,
+    port: targetPort,
+    href: location.href
+  });
+}
+
+if (mismatch && svc.disconnect) {
+  try { await svc.disconnect(); } catch (e) {}
+}
+if (!svc.isConnected?.() && svc.colabMcpServer?.closeServer) {
+  try { await svc.colabMcpServer.closeServer(); } catch (e) {}
+}
+sessionStorage.setItem('mcp_proxy_token', targetToken);
+sessionStorage.setItem('mcp_proxy_port', targetPort);
+const base = location.href.split('#')[0];
+history.replaceState(null, '', `${base}#mcpProxyToken=${encodeURIComponent(targetToken)}&mcpProxyPort=${encodeURIComponent(targetPort)}`);
+
+let alreadyConnected = false;
+updateBadge(false, 'MCP: 正在连接...');
+try {
+  await Promise.race([
+    svc.connect(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('localColabMcpService.connect timed out')), 20000))
+  ]);
+} catch (e) {
+  const msg = String(e?.message || e || '');
+  if (msg.includes('MCP server already connected') && svc.isConnected?.()) {
+    alreadyConnected = true;
+  } else {
+    updateBadge(false);
+    throw e;
+  }
+}
+
+const isConnectedNow = !!svc.isConnected?.();
+updateBadge(isConnectedNow);
+return JSON.stringify({
+  ok: true,
+  before,
+  mismatch,
+  alreadyConnected,
+  connected: isConnectedNow,
+  token: sessionStorage.getItem('mcp_proxy_token'),
+  port: sessionStorage.getItem('mcp_proxy_port'),
+  href: location.href
+});
+})()"""
     )
     evaluation = eval_colab(args.port, connect_js, await_promise=True)
     val = evaluation.get("result", {}).get("value")

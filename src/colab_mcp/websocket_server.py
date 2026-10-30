@@ -50,6 +50,8 @@ class ColabWebSocketServer:
         self.port = 0
         self.connection_lock = asyncio.Lock()
         self.connection_live = asyncio.Event()
+        self.connection_generation = 0
+        self._connection_count = 0
         self.allowed_origins = [COLAB, COLAB_ALT_DOMAIN]
         self._server: websockets.Server | None = None
 
@@ -65,6 +67,27 @@ class ColabWebSocketServer:
             anyio.create_memory_object_stream(0)
         )
         self.token = secrets.token_urlsafe(16)
+
+    def _reset_streams(self):
+        """Safely closes existing streams and re-creates clean memory streams for new connections."""
+        try:
+            self._read_stream_writer.close()
+        except Exception:
+            pass
+        try:
+            self.read_stream.close()
+        except Exception:
+            pass
+        try:
+            self.write_stream.close()
+        except Exception:
+            pass
+        try:
+            self._write_stream_reader.close()
+        except Exception:
+            pass
+        self._read_stream_writer, self.read_stream = anyio.create_memory_object_stream(0)
+        self.write_stream, self._write_stream_reader = anyio.create_memory_object_stream(0)
 
     def connection_info(self) -> dict:
         scratch_url = (
@@ -164,6 +187,10 @@ class ColabWebSocketServer:
             return
 
         async with self.connection_lock:
+            if self._connection_count > 0:
+                self._reset_streams()
+            self._connection_count += 1
+            self.connection_generation += 1
             try:
                 self.connection_live.set()
 

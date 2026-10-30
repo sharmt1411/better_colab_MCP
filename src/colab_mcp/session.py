@@ -18,6 +18,7 @@ from copy import deepcopy
 from collections.abc import AsyncIterator
 import contextlib
 from contextlib import AsyncExitStack
+import inspect
 import json
 import logging
 import os
@@ -1075,22 +1076,60 @@ class ColabProxyClient:
         self.stubbed_mcp_client = Client(FastMCP())
         self.proxy_mcp_client: Client | None = None
         self._exit_stack = AsyncExitStack()
-        self._start_task = None
+        self._active_exit_stack: AsyncExitStack | None = None
+        self._start_task: asyncio.Task | None = None
+        self._supervisor_task: asyncio.Task | None = None
+        self._stopped = False
+        self._connection_lock = asyncio.Lock()
+        self._client_ready = asyncio.Event()
 
     def is_connected(self):
-        return self.wss.connection_live.is_set() and self.proxy_mcp_client is not None
+        client_live = True
+        if self.proxy_mcp_client is not None:
+            is_conn_fn = getattr(self.proxy_mcp_client, "is_connected", None)
+            if callable(is_conn_fn) and not inspect.iscoroutinefunction(is_conn_fn):
+                try:
+                    res = is_conn_fn()
+                    if isinstance(res, bool):
+                        client_live = res
+                except Exception:
+                    pass
+        return (
+            self.wss.connection_live.is_set()
+            and self.proxy_mcp_client is not None
+            and client_live
+        )
 
     async def await_proxy_connection(self, timeout: float | None = None):
         wait_timeout = timeout if timeout is not None else UI_CONNECTION_TIMEOUT
-        with contextlib.suppress(asyncio.TimeoutError):
-            # wait for the connection to be live and for the proxy client to fully initialize
-            connection_tasks = asyncio.gather(
-                self.wss.connection_live.wait(), self._start_task
-            )
-            await asyncio.wait_for(
-                connection_tasks,
-                timeout=wait_timeout,
-            )
+        deadline = time.monotonic() + wait_timeout
+        while time.monotonic() < deadline:
+            if self.is_connected():
+                return
+            if self._start_task and not self._start_task.done():
+                with contextlib.suppress(asyncio.TimeoutError, Exception):
+                    await asyncio.wait_for(
+                        asyncio.shield(self._start_task),
+                        timeout=max(0.05, min(0.5, deadline - time.monotonic())),
+                    )
+                if self.is_connected():
+                    return
+            if not self.wss.connection_live.is_set():
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        self.wss.connection_live.wait(),
+                        timeout=max(0.05, min(0.5, deadline - time.monotonic())),
+                    )
+            if self.is_connected():
+                return
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self._client_ready.wait(),
+                    timeout=max(0.05, min(0.2, deadline - time.monotonic())),
+                )
+            if self.is_connected():
+                return
+            await asyncio.sleep(0.05)
 
     def client_factory(self):
         if self.is_connected():
@@ -1098,20 +1137,104 @@ class ColabProxyClient:
         # return a client mapped to a stubbed mcp server if there is no session proxy
         return self.stubbed_mcp_client
 
+    async def _connect_client_session(self):
+        """Creates a fresh Client and enters its async context."""
+        async with self._connection_lock:
+            if self._active_exit_stack is not None:
+                old_stack = self._active_exit_stack
+                self._active_exit_stack = None
+                self.proxy_mcp_client = None
+                self._client_ready.clear()
+                try:
+                    await asyncio.wait_for(old_stack.aclose(), timeout=3.0)
+                except Exception:
+                    pass
+
+            new_stack = AsyncExitStack()
+            try:
+                transport = ColabTransport(self.wss)
+                client = Client(transport)
+                self.proxy_mcp_client = await new_stack.enter_async_context(client)
+                self._active_exit_stack = new_stack
+                self._client_ready.set()
+                logging.info("Colab proxy MCP client session successfully established.")
+            except Exception:
+                self.proxy_mcp_client = None
+                self._client_ready.clear()
+                with contextlib.suppress(Exception):
+                    await new_stack.aclose()
+                raise
+
     async def _start_proxy_client(self):
         # blocks until a websocket connection is made successfully
-        self.proxy_mcp_client = await self._exit_stack.enter_async_context(
-            Client(ColabTransport(self.wss))
-        )
+        await self._connect_client_session()
+
+    async def _connection_supervisor(self):
+        if self._start_task:
+            with contextlib.suppress(Exception):
+                await self._start_task
+        last_generation = getattr(self.wss, "connection_generation", 0)
+        while not self._stopped:
+            try:
+                await self.wss.connection_live.wait()
+                if self._stopped:
+                    break
+
+                current_generation = getattr(self.wss, "connection_generation", 0)
+                if not self.is_connected() or current_generation != last_generation:
+                    last_generation = current_generation
+                    try:
+                        await self._connect_client_session()
+                    except Exception as e:
+                        logging.debug("Proxy client reconnect attempt failed: %s", e)
+                        await asyncio.sleep(0.5)
+                        continue
+
+                while self.wss.connection_live.is_set() and not self._stopped:
+                    if not self.is_connected():
+                        break
+                    await asyncio.sleep(0.25)
+
+                if not self.wss.connection_live.is_set():
+                    self._client_ready.clear()
+                    async with self._connection_lock:
+                        if self._active_exit_stack is not None:
+                            old_stack = self._active_exit_stack
+                            self._active_exit_stack = None
+                            self.proxy_mcp_client = None
+                            try:
+                                await asyncio.wait_for(old_stack.aclose(), timeout=2.0)
+                            except Exception:
+                                pass
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logging.debug("Error in connection supervisor: %s", e)
+                await asyncio.sleep(0.5)
 
     async def __aenter__(self):
+        self._stopped = False
         self._start_task = asyncio.create_task(self._start_proxy_client())
+        self._supervisor_task = asyncio.create_task(self._connection_supervisor())
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self._stopped = True
         if self._start_task:
             self._start_task.cancel()
+        if self._supervisor_task:
+            self._supervisor_task.cancel()
+        async with self._connection_lock:
+            if self._active_exit_stack:
+                try:
+                    await asyncio.wait_for(self._active_exit_stack.aclose(), timeout=2.0)
+                except Exception:
+                    pass
+                self._active_exit_stack = None
         await self._exit_stack.aclose()
+        self.proxy_mcp_client = None
+        self._client_ready.clear()
 
 
 class StaticColabProxyTool(Tool):
@@ -3363,6 +3486,10 @@ def _ensure_controlled_edge(url: str, *, port: str) -> None:
             f"--user-data-dir={profile}",
             "--no-first-run",
             "--new-window",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
             url,
         ],
         stdout=subprocess.DEVNULL,
@@ -4642,35 +4769,186 @@ def _perform_colab_tab_connection(
     target_port = json.dumps(mcp_port)
     target_url = json.dumps(url)
     expression = (
-        "(async()=>{"
-        "const svc=window.colab?.global?.notebook?.localColabMcpService;"
-        "if(!svc) return JSON.stringify({ok:false,error:'localColabMcpService missing'});"
-        f"const targetToken={target_token};"
-        f"const targetPort={target_port};"
-        f"const targetUrl={target_url};"
-        "const before={connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href};"
-        "const tokenChanged=Boolean(before.token&&before.token!==targetToken);"
-        "const portChanged=Boolean(before.port&&String(before.port)!==String(targetPort));"
-        "const mismatch=tokenChanged||portChanged;"
-        "if(svc.isConnected?.()&&!mismatch){"
-        "sessionStorage.setItem('mcp_proxy_token',targetToken);"
-        "sessionStorage.setItem('mcp_proxy_port',targetPort);"
-        "return JSON.stringify({ok:true,before,mismatch:false,alreadyConnected:true,connected:true,token:targetToken,port:targetPort,href:location.href});"
-        "}"
-        "if(mismatch&&svc.disconnect){try{await svc.disconnect();}catch(e){}}"
-        "if(!svc.isConnected?.()&&svc.colabMcpServer?.closeServer){try{await svc.colabMcpServer.closeServer();}catch(e){}}"
-        "sessionStorage.setItem('mcp_proxy_token',targetToken);"
-        "sessionStorage.setItem('mcp_proxy_port',targetPort);"
-        "history.replaceState(null,'',targetUrl);"
-        "let alreadyConnected=false;"
-        "try{await Promise.race([svc.connect(),new Promise((_,reject)=>setTimeout(()=>reject(new Error('localColabMcpService.connect timed out')),20000))]);}"
-        "catch(e){"
-        "const msg=String(e?.message||e||'');"
-        "if(msg.includes('MCP server already connected')&&svc.isConnected?.()){alreadyConnected=true;}"
-        "else{throw e;}"
-        "}"
-        "return JSON.stringify({ok:true,before,mismatch,alreadyConnected,connected:svc.isConnected?.(),token:sessionStorage.getItem('mcp_proxy_token'),port:sessionStorage.getItem('mcp_proxy_port'),href:location.href});"
-        "})()"
+        r"""(async () => {
+const svc = window.colab?.global?.notebook?.localColabMcpService;
+if (!svc) return JSON.stringify({ok: false, error: 'localColabMcpService missing'});
+const targetToken = """
+        + target_token
+        + r""";
+const targetPort = """
+        + target_port
+        + r""";
+const targetUrl = """
+        + target_url
+        + r""";
+function updateBadge(connected, statusText) {
+  try {
+    let badge = document.getElementById('colab-mcp-status-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.id = 'colab-mcp-status-badge';
+      badge.style.position = 'fixed';
+      badge.style.bottom = '12px';
+      badge.style.right = '12px';
+      badge.style.zIndex = '999999';
+      badge.style.display = 'flex';
+      badge.style.alignItems = 'center';
+      badge.style.gap = '6px';
+      badge.style.padding = '4px 10px';
+      badge.style.borderRadius = '16px';
+      badge.style.fontSize = '12px';
+      badge.style.fontFamily = 'system-ui, -apple-system, sans-serif';
+      badge.style.color = '#ffffff';
+      badge.style.backgroundColor = 'rgba(32, 33, 36, 0.88)';
+      badge.style.backdropFilter = 'blur(4px)';
+      badge.style.border = '1px solid rgba(255,255,255,0.15)';
+      badge.style.boxShadow = '0 2px 8px rgba(0,0,0,0.25)';
+      badge.style.cursor = 'pointer';
+      badge.style.userSelect = 'none';
+      badge.style.transition = 'all 0.2s ease';
+      badge.title = 'Colab 本地 MCP 连接状态（失焦保持后台连接，点击可手动触发重连）';
+      badge.onclick = async () => {
+        updateBadge(false, 'MCP: 正在手动重连...');
+        const s = window.colab?.global?.notebook?.localColabMcpService;
+        if (s && !s.isConnected?.()) {
+          try { await s.connect(); } catch (e) {}
+        }
+        updateBadge(!!s?.isConnected?.());
+      };
+      badge.innerHTML = '<span class="mcp-dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#34a853;"></span><span class="mcp-text">MCP: 连接中...</span>';
+      document.body.appendChild(badge);
+    }
+    const dot = badge.querySelector('.mcp-dot');
+    const text = badge.querySelector('.mcp-text');
+    if (!dot || !text) return;
+    if (statusText) {
+      dot.style.background = '#fbbc04';
+      dot.style.boxShadow = '0 0 6px #fbbc04';
+      text.innerText = statusText;
+      badge.style.borderColor = 'rgba(251, 188, 4, 0.5)';
+    } else if (connected) {
+      dot.style.background = '#34a853';
+      dot.style.boxShadow = '0 0 6px #34a853';
+      const p = targetPort || sessionStorage.getItem('mcp_proxy_port') || '';
+      text.innerText = `MCP: 已连接 (:${p})`;
+      badge.style.borderColor = 'rgba(52, 168, 83, 0.5)';
+    } else {
+      dot.style.background = '#ea4335';
+      dot.style.boxShadow = '0 0 6px #ea4335';
+      text.innerText = 'MCP: 已断开';
+      badge.style.borderColor = 'rgba(234, 67, 53, 0.5)';
+    }
+  } catch (e) {}
+}
+
+if (!window.__colab_mcp_keepalive_installed) {
+  window.__colab_mcp_keepalive_installed = true;
+  let autoReconnecting = false;
+  const checkAndAutoReconnect = async () => {
+    const s = window.colab?.global?.notebook?.localColabMcpService;
+    if (!s) return;
+    const isConn = !!s.isConnected?.();
+    if (isConn) {
+      autoReconnecting = false;
+      updateBadge(true);
+      return;
+    }
+    if (!autoReconnecting) {
+      autoReconnecting = true;
+      updateBadge(false, 'MCP: 正在自动重连...');
+      try {
+        const t = sessionStorage.getItem('mcp_proxy_token');
+        const p = sessionStorage.getItem('mcp_proxy_port');
+        if (t && p) {
+          if (s.colabMcpServer?.closeServer) {
+            try { await s.colabMcpServer.closeServer(); } catch (e) {}
+          }
+          await Promise.race([
+            s.connect(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('auto-reconnect timeout')), 15000))
+          ]);
+        }
+      } catch (err) {
+      } finally {
+        autoReconnecting = false;
+        updateBadge(!!s.isConnected?.());
+      }
+    }
+  };
+  setInterval(checkAndAutoReconnect, 4000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+      checkAndAutoReconnect();
+    }
+  });
+}
+
+const before = {
+  connected: svc.isConnected?.(),
+  token: sessionStorage.getItem('mcp_proxy_token'),
+  port: sessionStorage.getItem('mcp_proxy_port'),
+  href: location.href
+};
+const tokenChanged = Boolean(before.token && before.token !== targetToken);
+const portChanged = Boolean(before.port && String(before.port) !== String(targetPort));
+const mismatch = tokenChanged || portChanged;
+
+if (svc.isConnected?.() && !mismatch) {
+  sessionStorage.setItem('mcp_proxy_token', targetToken);
+  sessionStorage.setItem('mcp_proxy_port', targetPort);
+  updateBadge(true);
+  return JSON.stringify({
+    ok: true,
+    before,
+    mismatch: false,
+    alreadyConnected: true,
+    connected: true,
+    token: targetToken,
+    port: targetPort,
+    href: location.href
+  });
+}
+
+if (mismatch && svc.disconnect) {
+  try { await svc.disconnect(); } catch (e) {}
+}
+if (!svc.isConnected?.() && svc.colabMcpServer?.closeServer) {
+  try { await svc.colabMcpServer.closeServer(); } catch (e) {}
+}
+sessionStorage.setItem('mcp_proxy_token', targetToken);
+sessionStorage.setItem('mcp_proxy_port', targetPort);
+history.replaceState(null, '', targetUrl);
+
+let alreadyConnected = false;
+updateBadge(false, 'MCP: 正在连接...');
+try {
+  await Promise.race([
+    svc.connect(),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('localColabMcpService.connect timed out')), 20000))
+  ]);
+} catch (e) {
+  const msg = String(e?.message || e || '');
+  if (msg.includes('MCP server already connected') && svc.isConnected?.()) {
+    alreadyConnected = true;
+  } else {
+    updateBadge(false);
+    throw e;
+  }
+}
+
+const isConnectedNow = !!svc.isConnected?.();
+updateBadge(isConnectedNow);
+return JSON.stringify({
+  ok: true,
+  before,
+  mismatch,
+  alreadyConnected,
+  connected: isConnectedNow,
+  token: sessionStorage.getItem('mcp_proxy_token'),
+  port: sessionStorage.getItem('mcp_proxy_port'),
+  href: location.href
+});
+})()"""
     )
     try:
         evaluation = _edge_cdp_eval(websocket_url, expression, await_promise=True)
