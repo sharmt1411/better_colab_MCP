@@ -394,8 +394,15 @@ function getRealMcpConnection() {
   return { state: 'disconnected', ws, port };
 }
 
-function updateBadge(status) {
+function updateBadge(status, legacyText) {
   try {
+    if (typeof status === 'boolean') {
+      if (status) {
+        status = { type: 'connected', port: window.__colab_mcp_target_port || sessionStorage.getItem('mcp_proxy_port') };
+      } else {
+        status = legacyText ? { type: 'temporary_retry', text: legacyText } : { type: 'disconnected' };
+      }
+    }
     let badge = document.getElementById('colab-mcp-status-badge');
     if (!badge) {
       badge = document.createElement('div');
@@ -467,6 +474,21 @@ function updateBadge(status) {
 const MAX_AUTO_RETRIES = 3;
 if (typeof window.__colab_mcp_consecutive_failures === 'undefined') {
   window.__colab_mcp_consecutive_failures = 0;
+}
+
+if (svc && !svc.__colab_mcp_fused_connect) {
+  const origConnect = svc.connect.bind(svc);
+  svc.__colab_mcp_fused_connect = origConnect;
+  svc.connect = async function(...args) {
+    if (window.__colab_mcp_consecutive_failures >= MAX_AUTO_RETRIES) {
+      return;
+    }
+    const curConn = getRealMcpConnection();
+    if (curConn.state === 'connected') {
+      return;
+    }
+    return origConnect(...args);
+  };
 }
 
 let autoReconnecting = false;
