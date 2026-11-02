@@ -394,6 +394,21 @@ function getRealMcpConnection() {
   return { state: 'disconnected', ws, port };
 }
 
+function dismissConnectDialog() {
+  try {
+    const dialogs = document.querySelectorAll('.local-mcp-connect-dialog, mwc-dialog[heading*="Colab MCP"]');
+    dialogs.forEach(d => {
+      if (d && (d.open || d.hasAttribute('open'))) {
+        if (typeof d.close === 'function') {
+          try { d.close('cancel'); } catch (e) { d.remove(); }
+        } else {
+          d.remove();
+        }
+      }
+    });
+  } catch (e) {}
+}
+
 function updateBadge(status, legacyText) {
   try {
     if (typeof status === 'boolean') {
@@ -444,6 +459,7 @@ function updateBadge(status, legacyText) {
     if (!dot || !text) return;
 
     if (status.type === 'connected') {
+      dismissConnectDialog();
       dot.style.background = '#34a853';
       dot.style.boxShadow = '0 0 6px #34a853';
       text.innerText = `MCP: 已连接 (:${status.port || ''})`;
@@ -497,6 +513,7 @@ const checkConnectionState = async () => {
   if (conn.state === 'connected') {
     window.__colab_mcp_consecutive_failures = 0;
     updateBadge({ type: 'connected', port: conn.port });
+    dismissConnectDialog();
     return;
   }
 
@@ -555,7 +572,22 @@ if (!window.__colab_mcp_visibility_installed) {
     }
   });
 }
+
+if (!window.__colab_mcp_dialog_observer_installed) {
+  window.__colab_mcp_dialog_observer_installed = true;
+  try {
+    const obs = new MutationObserver(() => {
+      const cur = getRealMcpConnection();
+      if (cur.state === 'connected') {
+        dismissConnectDialog();
+      }
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+  } catch (e) {}
+}
+
 checkConnectionState();
+dismissConnectDialog();
 
 const beforeConn = getRealMcpConnection();
 const before = {
