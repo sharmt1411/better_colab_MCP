@@ -101,6 +101,15 @@ To ensure rock-solid reliability, prevent context exhaustion, and boost token ef
 - **Fixed Multi-Minute Reconnection Hang / Deadlock**:
   - `ColabWebSocketServer` resets memory streams on subsequent connections (`_reset_streams`), preventing dead connection errors from poisoning new streams.
   - `ColabProxyClient` features a dedicated supervisor (`_connection_supervisor`) that cleans up dead sessions and initializes a fresh `ClientSession` on reconnection, eliminating the bug where reconnection attempts hung indefinitely.
+- **Preferred Port & Token Persistence (Zero Port Drift)**:
+  - Binds to a preferred port `65036` by default (configurable via `COLAB_MCP_PORT`), with seamless fallback to dynamic ports on collisions.
+  - Generates and persists the auth token in `%TEMP%\colab-mcp-token.txt` (configurable via `COLAB_MCP_TOKEN`). When the MCP server or IDE restarts, it reuses the same port and token, allowing open Colab tabs to silently reconnect in the background without requiring manual intervention.
+- **Real WebSocket State Detection & 3-Strike Fuse Protection**:
+  - Bypasses Colab's native `isConnected()` bug (which returns `true` whenever a transport instance exists) by directly checking the underlying WebSocket `readyState === 1`.
+  - Transient network drops recover automatically in 1–2 attempts. If the server is stopped or port changed, consecutive failures trip a 3-strike fuse that halts further reconnect calls at the gate, completely preventing `net::ERR_CONNECTION_REFUSED` console spam.
+- **Auto-Dismissal of Colab's Redundant Connect Modal**:
+  - Colab's native UI pops up a modal dialog (`Connect to a local Colab MCP server`) on refresh or when proxy parameters are present.
+  - Built-in MutationObserver and connection event hooks automatically dismiss this redundant confirmation dialog the moment the background connection is active, delivering a clean, frictionless notebook refresh experience.
 
 
 ## Project Layout

@@ -101,6 +101,14 @@ Colab MCP 提供了 50+ 个细粒度工具，如果全量开启，**每个轮次
 - **彻底解决重连死锁/挂起数分钟 Bug**：
   - `ColabWebSocketServer` 重连时自动重置内存流（`_reset_streams`），杜绝旧异常与断开状态污染新连接。
   - `ColabProxyClient` 增加连接守护协程（`_connection_supervisor`），重连时自动进入全新的 `ClientSession` 上下文，彻底终结了断连后重连请求卡死挂起数分钟的问题。
+- **固定首选端口与 Token 持久化（根治端口漂移）**：
+  - 默认固定首选端口 `65036`（可通过环境变量 `COLAB_MCP_PORT` 自定义，端口被占用时自动平滑回退至随机端口）。
+  - Token 首次生成后自动持久化至本地缓存目录 `%TEMP%\colab-mcp-token.txt`（支持 `COLAB_MCP_TOKEN` 自定义）。服务或 IDE 重启后自动复用相同端口与 Token，已打开的 Colab 标签页在后台直接恢复连接，告别端口和 Token 漂移。
+- **真实物理连接探测与 3 次重试自动熔断（防控制台报错刷屏）**：
+  - 绕过 Colab 官方 `isConnected()` 只要存在 transport 实例就误报已连接的缺陷，深度基于底层的 `ws.readyState === 1` 做真实物理连接探测。
+  - 临时网络抖动 1~2 次内快速静默自愈；若服务停止或目标变动，连续失败达到 3 次后自动触发熔断，在入口处阻断任何底层的重连请求，彻底消除控制台 `net::ERR_CONNECTION_REFUSED` 报错刷屏，并将胶囊置为红色提示用户。
+- **Colab 官方连接弹窗自动清理（免去手动点击确认）**：
+  - 针对 Colab 官方在页面刷新或携带参数时弹出的 `Connect to a local Colab MCP server` 模态对话框，内置自动清理与 MutationObserver 监听。当底层物理连接建立后，毫秒级自动关闭该冗余对话框，带来丝滑无感的刷新体验。
 
 
 ## 项目结构
