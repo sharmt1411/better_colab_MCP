@@ -76,6 +76,11 @@ In practice, **we strongly recommend enabling only the 16 core tools below**, le
 To ensure rock-solid reliability, prevent context exhaustion, and boost token efficiency during long-running tasks, training runs, and evaluations, this project includes comprehensive agent-centric refinements:
 
 ### 1. Token Efficiency & Anti-Context-Overflow
+- **`run_code_cell` Output Summarization (Head 10 + Tail 10 Lines by Default)**:
+  - Code cell execution returns a compact summary showing the first 10 and last 10 lines (with 1-based line numbers and middle omitted line counts).
+  - Eliminates context explosion when cells output voluminous logs (e.g., ML training epoch outputs, large array/dataframe prints, verbose installation logs).
+  - Individual overlong lines are protected by `maxLineChars` truncation (default 1000 characters) and ANSI sequence stripping.
+  - Returns an actionable `hint`: if full details or specific line ranges are needed, the agent can call `read_cell_outputs(cellIds=['...'])` on demand.
 - **`get_cells` Streamlined (Outputs Excluded by Default)**:
   - Defaults to `includeOutputs: false`, completely stripping bulky output arrays from cell listings to avoid blowing up the LLM's context window.
   - Multi-line source arrays (`["line1\n", "line2\n"]`) are automatically merged into clean multi-line strings, eliminating substantial JSON quote and newline overhead.

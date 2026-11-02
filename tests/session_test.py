@@ -1522,3 +1522,153 @@ class TestStaticColabProxyTool:
         assert "outputs" in c1
         assert c1["hasOutputs"] is True
         assert parsed["includeOutputs"] is True
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_short_output(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        raw_run_response = {
+            "execution_count": 2,
+            "outputs": [
+                {"output_type": "stream", "text": "line1\nline2\nline3\n"}
+            ]
+        }
+        mock_result = Mock()
+        mock_result.content = [session.TextContent(type="text", text=json.dumps(raw_run_response))]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        run_tool = tools["run_code_cell"]
+
+        result = await run_tool.run({"cellId": "cell_1"})
+        parsed = json.loads(result.content[0].text)
+
+        assert parsed["cellId"] == "cell_1"
+        assert parsed["executionCount"] == 2
+        assert parsed["totalLines"] == 3
+        assert parsed["displayedLines"] == 3
+        assert parsed["truncated"] is False
+        assert "1: line1" in parsed["output"]
+        assert "2: line2" in parsed["output"]
+        assert "3: line3" in parsed["output"]
+        assert "lines omitted" not in parsed["output"]
+        assert len(parsed["outputs"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_long_output_truncates_10_and_10(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        fifty_lines = "\n".join(f"Epoch {i}/50" for i in range(1, 51))
+        raw_run_response = {
+            "execution_count": 5,
+            "outputs": [
+                {"output_type": "stream", "text": fifty_lines}
+            ]
+        }
+        mock_result = Mock()
+        mock_result.content = [session.TextContent(type="text", text=json.dumps(raw_run_response))]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        run_tool = tools["run_code_cell"]
+
+        result = await run_tool.run({"cellId": "train_cell"})
+        parsed = json.loads(result.content[0].text)
+
+        assert parsed["cellId"] == "train_cell"
+        assert parsed["totalLines"] == 50
+        assert parsed["displayedLines"] == 20
+        assert parsed["truncated"] is True
+        assert "hint" in parsed
+        assert "read_cell_outputs(cellIds=['train_cell'])" in parsed["hint"]
+
+        output_str = parsed["output"]
+        # First 10 lines
+        assert "1: Epoch 1/50" in output_str
+        assert "10: Epoch 10/50" in output_str
+        # Middle omitted message
+        assert "... [30 lines omitted. Use read_cell_outputs(cellIds=['train_cell']) for full output] ..." in output_str
+        # Last 10 lines (line numbers 41 to 50)
+        assert "41: Epoch 41/50" in output_str
+        assert "50: Epoch 50/50" in output_str
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_long_line_and_ansi_truncation(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        huge_line = "START_" + "X" * 2500 + "_END"
+        ansi_line = "\x1b[32mColored Output\x1b[0m"
+        raw_run_response = {
+            "execution_count": 7,
+            "outputs": [
+                {"output_type": "stream", "text": f"{ansi_line}\n{huge_line}"}
+            ]
+        }
+        mock_result = Mock()
+        mock_result.content = [session.TextContent(type="text", text=json.dumps(raw_run_response))]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        run_tool = tools["run_code_cell"]
+
+        result = await run_tool.run({"cellId": "c_long"})
+        parsed = json.loads(result.content[0].text)
+
+        output_str = parsed["output"]
+        # ANSI escape sequence must be stripped
+        assert "\x1b[" not in output_str
+        assert "1: Colored Output" in output_str
+        # Huge line must be truncated
+        assert "X" * 2500 not in output_str
+        assert "[truncated" in output_str
+        assert "chars]" in output_str
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_error_traceback(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        raw_run_response = {
+            "execution_count": 8,
+            "outputs": [
+                {
+                    "output_type": "error",
+                    "ename": "ZeroDivisionError",
+                    "evalue": "division by zero",
+                    "traceback": [
+                        "Traceback (most recent call last):",
+                        "  File '<stdin>', line 1, in <module>",
+                        "ZeroDivisionError: division by zero"
+                    ]
+                }
+            ]
+        }
+        mock_result = Mock()
+        mock_result.content = [session.TextContent(type="text", text=json.dumps(raw_run_response))]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        run_tool = tools["run_code_cell"]
+
+        result = await run_tool.run({"cellId": "err_cell"})
+        parsed = json.loads(result.content[0].text)
+
+        assert parsed["hasError"] is True
+        assert parsed["error"]["ename"] == "ZeroDivisionError"
+        assert parsed["error"]["evalue"] == "division by zero"
+        assert "ZeroDivisionError: division by zero" in parsed["output"]

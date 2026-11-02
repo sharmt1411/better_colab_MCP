@@ -88,6 +88,87 @@ def _truncate_long_line(line: str, max_line_chars: int = 1000) -> str:
     )
 
 
+def _summarize_cell_outputs(
+    outputs: list[dict],
+    cell_id: str | None = None,
+    head_lines: int = 10,
+    tail_lines: int = 10,
+    max_line_chars: int = 1000,
+) -> tuple[str, int, int, bool, dict | None]:
+    """
+    Summarizes cell outputs by keeping the first `head_lines` and last `tail_lines`.
+    Strips ANSI escape sequences and truncates overlong lines.
+    Returns (formatted_summary_text, total_lines, displayed_lines, has_error, error_info).
+    """
+    if not outputs:
+        return "", 0, 0, False, None
+
+    has_error = False
+    error_info = None
+
+    all_raw_lines: list[str] = []
+    for op in outputs:
+        if not isinstance(op, dict):
+            continue
+        op_type = op.get("output_type", "")
+        if op_type == "error":
+            has_error = True
+            error_info = {
+                "ename": op.get("ename"),
+                "evalue": op.get("evalue"),
+            }
+            tb = op.get("traceback") or []
+            chunk_text = "\n".join(tb) if tb else f"{op.get('ename')}: {op.get('evalue')}"
+        elif "text" in op:
+            t = op.get("text", "")
+            chunk_text = "".join(t) if isinstance(t, list) else str(t)
+        elif "data" in op and isinstance(op["data"], dict) and "text/plain" in op["data"]:
+            tp = op["data"]["text/plain"]
+            chunk_text = "".join(tp) if isinstance(tp, list) else str(tp)
+        else:
+            chunk_text = ""
+
+        if chunk_text:
+            cleaned = _strip_ansi_sequences(chunk_text)
+            for line in cleaned.splitlines():
+                all_raw_lines.append(_truncate_long_line(line, max_line_chars=max_line_chars))
+
+    total_lines = len(all_raw_lines)
+    if total_lines == 0:
+        return "", 0, 0, has_error, error_info
+
+    max_allowed = head_lines + tail_lines
+    if total_lines <= max_allowed:
+        formatted = "\n".join(
+            f"{idx + 1}: {line}" for idx, line in enumerate(all_raw_lines)
+        )
+        return formatted, total_lines, total_lines, has_error, error_info
+
+    # Head lines: 1 to head_lines
+    head = all_raw_lines[:head_lines]
+    head_formatted = "\n".join(
+        f"{idx + 1}: {line}" for idx, line in enumerate(head)
+    )
+
+    omitted = total_lines - head_lines - tail_lines
+    read_hint = (
+        f"read_cell_outputs(cellIds=['{cell_id}'])"
+        if cell_id
+        else "read_cell_outputs"
+    )
+    separator = f"... [{omitted} lines omitted. Use {read_hint} for full output] ..."
+
+    # Tail lines: (total_lines - tail_lines + 1) to total_lines
+    tail = all_raw_lines[-tail_lines:]
+    tail_start_no = total_lines - tail_lines + 1
+    tail_formatted = "\n".join(
+        f"{tail_start_no + idx}: {line}" for idx, line in enumerate(tail)
+    )
+
+    formatted = f"{head_formatted}\n{separator}\n{tail_formatted}"
+    return formatted, total_lines, max_allowed, has_error, error_info
+
+
 COLAB_STATIC_TOOL_SCHEMAS = {
     "add_code_cell": {
         "description": "Inserts a code type cell at the provided index and shifts existing cells. The resulting new cell id is returned.",
@@ -195,7 +276,7 @@ COLAB_STATIC_TOOL_SCHEMAS = {
         },
     },
     "run_code_cell": {
-        "description": "Executes the code in the cell with the provided cell ID. The cell must be a code cell type. The output of the cell execution is returned.",
+        "description": "Executes the code in the cell with the provided cell ID. Returns the execution output summary (first 10 and last 10 lines by default, with line numbers and long-line truncation). If detailed or full output is needed, use read_cell_outputs.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1341,6 +1422,73 @@ class StaticColabProxyTool(Tool):
             except Exception as exc:
                 logging.debug("Failed to post-process get_cells output: %s", exc)
 
+        if self._upstream_name == "run_code_cell" and content_items:
+            cell_id = call_args.get("cellId")
+            try:
+                raw_text = content_items[0].text
+                data = json.loads(raw_text)
+                if isinstance(data, dict):
+                    raw_outputs = data.get("outputs", [])
+                    exec_count = data.get("execution_count")
+                    (
+                        output_summary,
+                        total_lines,
+                        displayed_lines,
+                        has_error,
+                        error_info,
+                    ) = _summarize_cell_outputs(
+                        raw_outputs,
+                        cell_id=cell_id,
+                        head_lines=10,
+                        tail_lines=10,
+                        max_line_chars=1000,
+                    )
+
+                    new_payload = {
+                        "cellId": cell_id,
+                        "executionCount": exec_count,
+                        "hasError": has_error,
+                        "totalLines": total_lines,
+                        "displayedLines": displayed_lines,
+                        "output": output_summary,
+                    }
+                    if has_error and error_info:
+                        new_payload["error"] = error_info
+                    if total_lines > displayed_lines:
+                        new_payload["truncated"] = True
+                        new_payload["hint"] = (
+                            f"Output truncated ({displayed_lines}/{total_lines} lines shown). "
+                            f"Use read_cell_outputs(cellIds=['{cell_id}']) to read complete output."
+                        )
+                    else:
+                        new_payload["truncated"] = False
+
+                    if total_lines <= 20:
+                        new_payload["outputs"] = raw_outputs
+                    else:
+                        new_payload["outputs"] = [
+                            {
+                                "output_type": "stream",
+                                "name": "stdout",
+                                "text": output_summary,
+                            }
+                        ]
+
+                    content_items[0] = TextContent(
+                        type="text",
+                        text=json.dumps(new_payload, ensure_ascii=False, indent=2),
+                    )
+                    structured_content.update({
+                        "cellId": cell_id,
+                        "executionCount": exec_count,
+                        "hasError": has_error,
+                        "totalLines": total_lines,
+                        "displayedLines": displayed_lines,
+                        "truncated": total_lines > displayed_lines,
+                    })
+            except Exception as exc:
+                logging.debug("Failed to post-process run_code_cell output: %s", exc)
+
         return ToolResult(
             content=content_items,
             structured_content={
@@ -2096,7 +2244,32 @@ class ColabRuntimeManagementTool(Tool):
                     "error": error,
                 }
                 if include_outputs:
-                    entry["outputs"] = outputs
+                    (
+                        summary_text,
+                        total_lines,
+                        disp_lines,
+                        _,
+                        _,
+                    ) = _summarize_cell_outputs(
+                        outputs,
+                        cell_id=cell_id,
+                        head_lines=10,
+                        tail_lines=10,
+                        max_line_chars=1000,
+                    )
+                    entry["output"] = summary_text
+                    entry["totalLines"] = total_lines
+                    if total_lines > disp_lines:
+                        entry["truncated"] = True
+                        entry["outputs"] = [
+                            {
+                                "output_type": "stream",
+                                "name": "stdout",
+                                "text": summary_text,
+                            }
+                        ]
+                    else:
+                        entry["outputs"] = outputs
                 results.append(entry)
                 if (has_error or timed_out) and stop_on_error:
                     break
