@@ -575,8 +575,14 @@ class TestColabSessionProxy:
         mock_colab_web_socket_server,
         mock_tool_injection_middleware,
     ):
-        mock_colab_web_socket_server.return_value.__aenter__ = AsyncMock()
-        mock_colab_proxy_client.return_value.__aenter__ = AsyncMock()
+        mock_colab_web_socket_server.return_value.__aenter__ = AsyncMock(
+            return_value=Mock()
+        )
+        proxy_client = Mock()
+        proxy_client.is_connected.return_value = False
+        mock_colab_proxy_client.return_value.__aenter__ = AsyncMock(
+            return_value=proxy_client
+        )
         proxy = session.ColabSessionProxy()
         await proxy.start_proxy_server()
         mock_colab_proxy_client.assert_called_once()
@@ -1672,3 +1678,149 @@ class TestStaticColabProxyTool:
         assert parsed["error"]["ename"] == "ZeroDivisionError"
         assert parsed["error"]["evalue"] == "division by zero"
         assert "ZeroDivisionError: division by zero" in parsed["output"]
+
+
+class TestCoreOnlyMode:
+    EXPECTED_CORE_TOOLS = {
+        "open_colab_browser_connection",
+        "connect_runtime",
+        "check_runtime",
+        "restart_runtime",
+        "shutdown_runtime",
+        "check_gpu",
+        "get_cells",
+        "add_code_cell",
+        "add_text_cell",
+        "delete_cell",
+        "update_cell",
+        "patch_cell",
+        "run_code_cell",
+        "cancel_queued_cells",
+        "read_cell_outputs",
+        "run_shell_command",
+    }
+
+    def test_core_only_tool_builders_return_exact_16_tools(self, mock_proxy_client):
+        assert len(session.CORE_TOOL_NAMES) == 16
+        assert session.CORE_TOOL_NAMES == self.EXPECTED_CORE_TOOLS
+
+        static_tools = session.make_static_colab_proxy_tools(
+            mock_proxy_client, core_only=True
+        )
+        management_tools = session.make_colab_management_tools(
+            mock_proxy_client, core_only=True
+        )
+        core_names = {
+            session.check_session_proxy_tool.name,
+            *(tool.name for tool in static_tools),
+            *(tool.name for tool in management_tools),
+        }
+        assert core_names == self.EXPECTED_CORE_TOOLS
+        assert len(core_names) == 16
+
+        full_static = session.make_static_colab_proxy_tools(
+            mock_proxy_client, core_only=False
+        )
+        full_mgmt = session.make_colab_management_tools(
+            mock_proxy_client, core_only=False
+        )
+        assert len(full_static) + len(full_mgmt) + 1 > 50
+
+    def test_parse_args_and_env_core_only(self, monkeypatch):
+        import colab_mcp
+
+        monkeypatch.delenv(session.CORE_ONLY_ENV, raising=False)
+        assert colab_mcp.parse_args([]).core_only is False
+        assert colab_mcp.parse_args(["--core-only"]).core_only is True
+
+        monkeypatch.setenv(session.CORE_ONLY_ENV, "1")
+        assert session.is_core_only_env() is True
+        assert colab_mcp.parse_args([]).core_only is True
+        assert colab_mcp.parse_args(["--no-core-only"]).core_only is False
+
+        monkeypatch.setenv(session.CORE_ONLY_ENV, "true")
+        assert session.is_core_only_env() is True
+
+        monkeypatch.setenv(session.CORE_ONLY_ENV, "0")
+        assert session.is_core_only_env() is False
+        assert colab_mcp.parse_args(["--core-only"]).core_only is True
+
+    @pytest.mark.asyncio
+    async def test_core_only_middleware_filters_and_deduplicates_tools(
+        self, mock_proxy_client
+    ):
+        from fastmcp import Client, FastMCP
+        from fastmcp.exceptions import ToolError
+        from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
+
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.wss = Mock(token="tok", port=65036)
+
+        upstream = FastMCP("Upstream")
+
+        @upstream.tool(name="get_cells")
+        def upstream_get_cells() -> str:
+            return "upstream"
+
+        @upstream.tool(name="move_cell")
+        def upstream_move_cell() -> str:
+            return "moved"
+
+        @upstream.tool(name="start_here")
+        def upstream_start_here() -> str:
+            return "guide"
+
+        server = FastMCP("TestCoreOnly")
+        server.mount(upstream)
+        server.add_middleware(
+            session.ColabProxyMiddleware(mock_proxy_client, core_only=True)
+        )
+        server.add_middleware(
+            ToolInjectionMiddleware(
+                tools=[
+                    session.check_session_proxy_tool,
+                    *session.make_static_colab_proxy_tools(
+                        mock_proxy_client, core_only=True
+                    ),
+                    *session.make_colab_management_tools(
+                        mock_proxy_client, core_only=True
+                    ),
+                ]
+            )
+        )
+
+        async with Client(server) as client:
+            listed = await client.list_tools()
+            listed_names = [tool.name for tool in listed]
+            assert len(listed_names) == 16
+            assert set(listed_names) == self.EXPECTED_CORE_TOOLS
+
+            with pytest.raises(ToolError, match="core-only"):
+                await client.call_tool("move_cell", {})
+            with pytest.raises(ToolError, match="core-only"):
+                await client.call_tool("start_here", {})
+
+    @pytest.mark.asyncio
+    @patch("colab_mcp.session.ColabWebSocketServer")
+    @patch("colab_mcp.session.ColabProxyClient")
+    async def test_colab_session_proxy_respects_core_only_env(
+        self,
+        mock_colab_proxy_client,
+        mock_colab_web_socket_server,
+        monkeypatch,
+    ):
+        mock_colab_web_socket_server.return_value.__aenter__ = AsyncMock(
+            return_value=Mock()
+        )
+        proxy_client = Mock()
+        proxy_client.is_connected.return_value = False
+        mock_colab_proxy_client.return_value.__aenter__ = AsyncMock(
+            return_value=proxy_client
+        )
+
+        monkeypatch.setenv(session.CORE_ONLY_ENV, "1")
+        proxy = session.ColabSessionProxy()
+        assert proxy.core_only is True
+        await proxy.start_proxy_server()
+        assert proxy.middleware[0].core_only is True
+        assert len(proxy.middleware[1]._tools_to_inject) == 16

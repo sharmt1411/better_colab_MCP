@@ -69,6 +69,39 @@ In practice, **we strongly recommend enabling only the 16 core tools below**, le
 > 2. **Shell Versatility**: Dedicated file tools (`list_files`, `make_directory`, `delete_file`) and environment tools (`set_env_vars`) are effortlessly handled with standard Linux commands via `run_shell_command` (`ls`, `mkdir`, `rm`, `export`).
 > 3. **Token Efficiency**: Pruning 50+ tools down to 16 **saves thousands of system prompt tokens** per turn, reduces hallucination, and speeds up agent response time.
 
+### Server-Side Core-Only Mode (`--core-only` / `COLAB_MCP_CORE_ONLY=1`)
+
+For MCP clients or plugin formats (such as Antigravity `mcp_config.json`) that do not support client-side `disabledTools` lists, start the server in core-only mode so it registers and exposes only the 16 core tools:
+
+```powershell
+uv run colab-mcp --core-only
+```
+
+Or via environment variable:
+
+```powershell
+$env:COLAB_MCP_CORE_ONLY = "1"
+uv run colab-mcp
+```
+
+Example `mcp_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "colab-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "<path-to-colab_mcp>", "colab-mcp", "--core-only"],
+      "env": {
+        "COLAB_MCP_CORE_ONLY": "1",
+        "COLAB_MCP_EDGE_CDP_PORT": "9333",
+        "COLAB_MCP_EDGE_URL_CONTAINS": "colab.research.google.com"
+      }
+    }
+  }
+}
+```
+
 ---
 
 ## Key Agent-Centric Optimizations

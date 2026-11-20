@@ -69,6 +69,39 @@ Colab MCP 提供了 50+ 个细粒度工具，如果全量开启，**每个轮次
 > 2. **Shell 万能替代**：文件操作（`list_files`、`make_directory`、`delete_file`、`stat_file`）以及环境变量（`set_env_vars`、`load_env_file`），在 `run_shell_command` 中通过常规 Linux 命令（`ls`, `mkdir`, `rm`, `export`）更加灵活直接，完全无需专用 MCP 工具常驻上下文。
 > 3. **极简上下文**：将工具数从 50+ 精简至 16 个，每次对话可直接**节约数千 Token**，模型响应更快、出错率更低。
 
+### 服务端精简模式（`--core-only` / `COLAB_MCP_CORE_ONLY=1`）
+
+对于不支持客户端 `disabledTools` 字段的 MCP 客户端或插件规范（例如 Antigravity 插件的 `mcp_config.json`），可直接让服务端以核心模式启动，只注册并暴露上述 16 个核心工具：
+
+```powershell
+uv run colab-mcp --core-only
+```
+
+或通过环境变量开启：
+
+```powershell
+$env:COLAB_MCP_CORE_ONLY = "1"
+uv run colab-mcp
+```
+
+`mcp_config.json` 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "colab-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "<path-to-colab_mcp>", "colab-mcp", "--core-only"],
+      "env": {
+        "COLAB_MCP_CORE_ONLY": "1",
+        "COLAB_MCP_EDGE_CDP_PORT": "9333",
+        "COLAB_MCP_EDGE_URL_CONTAINS": "colab.research.google.com"
+      }
+    }
+  }
+}
+```
+
 ---
 
 ## 针对 AI Agent 调用的关键细节优化

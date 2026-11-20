@@ -22,7 +22,7 @@ import sys
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
 
-from colab_mcp.session import ColabSessionProxy
+from colab_mcp.session import CORE_ONLY_ENV, ColabSessionProxy, is_core_only_env
 
 
 mcp = FastMCP(name="ColabMCP")
@@ -60,16 +60,25 @@ def parse_args(v):
         action="store_true",
         default=True,
     )
+    parser.add_argument(
+        "--core-only",
+        help=(
+            "expose only the 16 core tools instead of the full 50+ toolset "
+            f"(can also be enabled via {CORE_ONLY_ENV}=1)."
+        ),
+        action=argparse.BooleanOptionalAction,
+        default=is_core_only_env(),
+    )
     return parser.parse_args(v)
 
 
-async def main_async():
-    args = parse_args(sys.argv[1:])
+async def main_async(argv: list[str] | None = None):
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     init_logger(args.log)
 
     if args.enable_proxy:
-        logging.info("enabling session proxy tools")
-        session_mcp = ColabSessionProxy()
+        logging.info("enabling session proxy tools (core_only=%s)", args.core_only)
+        session_mcp = ColabSessionProxy(core_only=args.core_only)
         await session_mcp.start_proxy_server()
         mcp.mount(session_mcp.proxy_server)
         for middleware in session_mcp.middleware:

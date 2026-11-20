@@ -15,7 +15,7 @@
 import asyncio
 import base64
 from copy import deepcopy
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 import contextlib
 from contextlib import AsyncExitStack
 import inspect
@@ -34,6 +34,7 @@ from itertools import count
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
 from fastmcp.dependencies import CurrentContext
+from fastmcp.exceptions import ToolError
 from fastmcp.server.context import Context
 from fastmcp.server.middleware import Middleware, MiddlewareContext
 from fastmcp.server.middleware.tool_injection import ToolInjectionMiddleware
@@ -52,6 +53,27 @@ FE_CONNECTED_KEY = "fe_connected"
 PROXY_TOKEN_KEY = "proxy_token"
 PROXY_PORT_KEY = "proxy_port"
 INJECTED_TOOL_NAME = "open_colab_browser_connection"
+CORE_ONLY_ENV = "COLAB_MCP_CORE_ONLY"
+CORE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        INJECTED_TOOL_NAME,
+        "connect_runtime",
+        "check_runtime",
+        "restart_runtime",
+        "shutdown_runtime",
+        "check_gpu",
+        "get_cells",
+        "add_code_cell",
+        "add_text_cell",
+        "delete_cell",
+        "update_cell",
+        "patch_cell",
+        "run_code_cell",
+        "cancel_queued_cells",
+        "read_cell_outputs",
+        "run_shell_command",
+    }
+)
 ENV_SETUP_MARKER_PREFIX = "# COLAB_MCP_ENV_SETUP:"
 EDGE_CDP_PORT_ENV = "COLAB_MCP_EDGE_CDP_PORT"
 EDGE_CDP_URL_CONTAINS_ENV = "COLAB_MCP_EDGE_URL_CONTAINS"
@@ -60,6 +82,13 @@ EDGE_PATH_ENV = "COLAB_MCP_EDGE_PATH"
 DEFAULT_EDGE_CDP_PORT = "9333"
 DEFAULT_EDGE_PROFILE = Path.home() / ".codex" / "edge-colab-mcp-profile"
 _TERMINAL_COMMAND_LOCK: asyncio.Lock | None = None
+
+
+def is_core_only_env(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether COLAB_MCP_CORE_ONLY requests core-only tool registration."""
+    source = os.environ if env is None else env
+    raw = source.get(CORE_ONLY_ENV, "")
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _terminal_command_lock() -> asyncio.Lock:
@@ -3472,7 +3501,11 @@ class ColabRuntimeManagementTool(Tool):
         )
 
 
-def make_static_colab_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
+def make_static_colab_proxy_tools(
+    proxy_client: ColabProxyClient,
+    *,
+    core_only: bool = False,
+) -> list[Tool]:
     return [
         StaticColabProxyTool(
             proxy_client=proxy_client,
@@ -3481,10 +3514,15 @@ def make_static_colab_proxy_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             parameters=deepcopy(spec["parameters"]),
         )
         for name, spec in COLAB_STATIC_TOOL_SCHEMAS.items()
+        if not core_only or name in CORE_TOOL_NAMES
     ]
 
 
-def make_colab_management_tools(proxy_client: ColabProxyClient) -> list[Tool]:
+def make_colab_management_tools(
+    proxy_client: ColabProxyClient,
+    *,
+    core_only: bool = False,
+) -> list[Tool]:
     return [
         ColabRuntimeManagementTool(
             proxy_client=proxy_client,
@@ -3493,13 +3531,28 @@ def make_colab_management_tools(proxy_client: ColabProxyClient) -> list[Tool]:
             parameters=deepcopy(spec["parameters"]),
         )
         for name, spec in COLAB_MANAGEMENT_TOOL_SCHEMAS.items()
+        if not core_only or name in CORE_TOOL_NAMES
     ]
 
 
 class ColabProxyMiddleware(Middleware):
-    def __init__(self, proxy_client: ColabProxyClient):
+    def __init__(self, proxy_client: ColabProxyClient, *, core_only: bool = False):
         self.proxy_client = proxy_client
+        self.core_only = core_only
         self.last_message_connected = self.proxy_client.is_connected()
+
+    async def on_list_tools(self, context: MiddlewareContext, call_next):
+        tools = await call_next(context)
+        if not self.core_only:
+            return tools
+        # Keep only the 16 core tools and deduplicate (preferring injected wrappers over upstream ProxyTools).
+        filtered: list[Tool] = []
+        seen: set[str] = set()
+        for tool in tools:
+            if tool.name in CORE_TOOL_NAMES and tool.name not in seen:
+                seen.add(tool.name)
+                filtered.append(tool)
+        return filtered
 
     async def on_message(self, context: MiddlewareContext, call_next):
         """
@@ -3523,6 +3576,11 @@ class ColabProxyMiddleware(Middleware):
         return result
 
     async def on_call_tool(self, context, call_next):
+        if self.core_only and context.message.name not in CORE_TOOL_NAMES:
+            raise ToolError(
+                f"Tool '{context.message.name}' is disabled in core-only mode "
+                f"(--core-only / {CORE_ONLY_ENV}=1)."
+            )
         result = await call_next(context)
         if context.message.name != INJECTED_TOOL_NAME:
             return result
@@ -5371,12 +5429,13 @@ check_session_proxy_tool = Tool.from_function(
 
 
 class ColabSessionProxy:
-    def __init__(self):
+    def __init__(self, *, core_only: bool | None = None):
         self._exit_stack = AsyncExitStack()
         self.proxy_server: FastMCPProxy | None = None
         # list order matters, see: https://gofastmcp.com/servers/middleware#multiple-middleware
         self.middleware: list[Middleware] = []
         self.wss: ColabWebSocketServer | None = None
+        self.core_only = is_core_only_env() if core_only is None else bool(core_only)
 
     async def start_proxy_server(self):
         self.wss = await self._exit_stack.enter_async_context(ColabWebSocketServer())
@@ -5388,13 +5447,19 @@ class ColabSessionProxy:
             instructions="Connects to a user's Google Colab session in a browser and allows for interactions with their Google Colab notebook",
         )
         # ColabProxyMiddleware must be first because it sets the fe_connected state
-        self.middleware.append(ColabProxyMiddleware(proxy_client))
+        self.middleware.append(
+            ColabProxyMiddleware(proxy_client, core_only=self.core_only)
+        )
         self.middleware.append(
             ToolInjectionMiddleware(
                 tools=[
                     check_session_proxy_tool,
-                    *make_static_colab_proxy_tools(proxy_client),
-                    *make_colab_management_tools(proxy_client),
+                    *make_static_colab_proxy_tools(
+                        proxy_client, core_only=self.core_only
+                    ),
+                    *make_colab_management_tools(
+                        proxy_client, core_only=self.core_only
+                    ),
                 ]
             )
         )
