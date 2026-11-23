@@ -114,6 +114,10 @@ To ensure rock-solid reliability, prevent context exhaustion, and boost token ef
   - Eliminates context explosion when cells output voluminous logs (e.g., ML training epoch outputs, large array/dataframe prints, verbose installation logs).
   - Individual overlong lines are protected by `maxLineChars` truncation (default 1000 characters) and ANSI sequence stripping.
   - Returns an actionable `hint`: if full details or specific line ranges are needed, the agent can call `read_cell_outputs(cellIds=['...'])` on demand.
+- **`run_code_cell` Non-Interrupting Timeout (`timeoutSeconds`) & Live Cell Status Tracking**:
+  - `run_code_cell` accepts an optional `timeoutSeconds` parameter (`>= 0`). If the cell is still running when `timeoutSeconds` expires, the tool returns a structured `running` / `timedOut` response **without interrupting cell execution in Colab** (shielded via `asyncio.shield`).
+  - `get_cell_status` and `wait_for_cells` combine live Colab browser CDP probing (inspecting both the notebook model/execution queue and DOM indicators) with MCP in-flight execution tracking, accurately distinguishing `running` and `queued` cells from stale notebook snapshots.
+  - `read_cell_outputs` and `get_cells` also expose in-flight `state`/`busy` (and `runningCellIds`) so agents in `--core-only` mode can reliably monitor long-running foreground cells until completion.
 - **`get_cells` Streamlined (Outputs Excluded by Default)**:
   - Defaults to `includeOutputs: false`, completely stripping bulky output arrays from cell listings to avoid blowing up the LLM's context window.
   - Multi-line source arrays (`["line1\n", "line2\n"]`) are automatically merged into clean multi-line strings, eliminating substantial JSON quote and newline overhead.

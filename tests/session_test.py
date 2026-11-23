@@ -721,6 +721,28 @@ class TestOutputNormalization:
         assert error["state"] == "error"
         assert error["hasError"] is True
 
+    def test_cell_status_live_state_overrides_stale_snapshot(self):
+        running = session.ColabRuntimeManagementTool._cell_status(
+            {"id": "a", "cell_type": "code", "execution_count": 3, "outputs": []},
+            0,
+            live_state={"busy": True, "queued": False, "source": "cdp-model"},
+        )
+        queued = session.ColabRuntimeManagementTool._cell_status(
+            {"id": "b", "cell_type": "code", "execution_count": 1, "outputs": []},
+            1,
+            live_state={"busy": False, "queued": True, "source": "cdp-dom"},
+        )
+
+        assert running["state"] == "running"
+        assert running["busy"] is True
+        assert running["queued"] is False
+        assert running["statusSource"] == "cdp-model"
+
+        assert queued["state"] == "queued"
+        assert queued["busy"] is False
+        assert queued["queued"] is True
+        assert queued["statusSource"] == "cdp-dom"
+
     def test_redacted_env(self):
         values = {
             "NORMAL": "visible",
@@ -1678,6 +1700,633 @@ class TestStaticColabProxyTool:
         assert parsed["error"]["ename"] == "ZeroDivisionError"
         assert parsed["error"]["evalue"] == "division by zero"
         assert "ZeroDivisionError: division by zero" in parsed["output"]
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_timeout_returns_running_and_tracks_inflight(
+        self, mock_proxy_client, monkeypatch
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+
+        release_cell = asyncio.Event()
+        mock_result = Mock()
+        mock_result.content = [
+            session.TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "execution_count": 4,
+                        "outputs": [{"output_type": "stream", "text": "done\n"}],
+                    }
+                ),
+            )
+        ]
+        mock_result.structuredContent = {}
+
+        async def slow_upstream(name, args):
+            assert name == "run_code_cell"
+            assert args == {"cellId": "train_cell"}
+            await release_cell.wait()
+            return mock_result
+
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.side_effect = slow_upstream
+        monkeypatch.setattr(
+            session,
+            "_evaluate_colab_page",
+            Mock(side_effect=RuntimeError("no cdp")),
+        )
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        run_tool = tools["run_code_cell"]
+        assert "timeoutSeconds" in run_tool.parameters["properties"]
+
+        timed_out_result = await run_tool.run(
+            {"cellId": "train_cell", "timeoutSeconds": 0.02}
+        )
+        parsed = json.loads(timed_out_result.content[0].text)
+        assert parsed["cellId"] == "train_cell"
+        assert parsed["state"] == "running"
+        assert parsed["busy"] is True
+        assert parsed["timedOut"] is True
+        assert parsed["timeoutSeconds"] == 0.02
+        assert parsed["status"] == "running"
+        assert timed_out_result.structured_content["ok"] is True
+
+        status_tool = management_tool(mock_proxy_client, "get_cell_status")
+        status_tool._call_colab = AsyncMock(
+            return_value=tool_result(
+                {
+                    "cells": [
+                        {
+                            "id": "train_cell",
+                            "cell_type": "code",
+                            "source": ["!python train.py"],
+                            "outputs": [],
+                        }
+                    ]
+                }
+            )
+        )
+
+        during = await status_tool.run({"cellIds": ["train_cell"]})
+        during_cell = during.structured_content["cells"][0]
+        assert during_cell["state"] == "running"
+        assert during_cell["busy"] is True
+        assert during_cell["statusSource"] == "mcp-inflight"
+        assert during.structured_content["liveProbeAvailable"] is False
+
+        release_cell.set()
+        await asyncio.sleep(0.02)
+
+        status_tool._call_colab = AsyncMock(
+            return_value=tool_result(
+                {
+                    "cells": [
+                        {
+                            "id": "train_cell",
+                            "cell_type": "code",
+                            "execution_count": 4,
+                            "source": ["!python train.py"],
+                            "outputs": [{"output_type": "stream", "text": "done\n"}],
+                        }
+                    ]
+                }
+            )
+        )
+        after = await status_tool.run({"cellIds": ["train_cell"]})
+        after_cell = after.structured_content["cells"][0]
+        assert after_cell["state"] == "success"
+        assert after_cell["busy"] is False
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_rejects_negative_timeout(self, mock_proxy_client):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        for bad_timeout in (-1, float("nan"), float("inf"), True, False):
+            with pytest.raises(ValueError, match="timeoutSeconds"):
+                await tools["run_code_cell"].run(
+                    {"cellId": "c1", "timeoutSeconds": bad_timeout}
+                )
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_completes_before_timeout_and_cleans_up(
+        self, mock_proxy_client
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        mock_result = Mock()
+        mock_result.content = [
+            session.TextContent(
+                type="text",
+                text=json.dumps(
+                    {
+                        "execution_count": 7,
+                        "outputs": [{"output_type": "stream", "text": "fast\n"}],
+                    }
+                ),
+            )
+        ]
+        mock_result.structuredContent = {}
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.return_value = mock_result
+
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        result = await tools["run_code_cell"].run(
+            {"cellId": "fast_cell", "timeoutSeconds": 2.0}
+        )
+        parsed = json.loads(result.content[0].text)
+        assert parsed["cellId"] == "fast_cell"
+        assert parsed["executionCount"] == 7
+        assert "fast" in parsed["output"]
+        assert result.structured_content["status"] == "ok"
+        assert (
+            "fast_cell"
+            not in session._active_cell_executions_map(mock_proxy_client)
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_timeout_zero_and_background_failure_cleans_up(
+        self, mock_proxy_client
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        fail_gate = asyncio.Event()
+
+        async def failing_upstream(_name, _args):
+            await fail_gate.wait()
+            raise RuntimeError("upstream boom")
+
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.side_effect = failing_upstream
+
+        core_tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(
+                mock_proxy_client, core_only=True
+            )
+        }
+        assert "get_cell_status" not in core_tools["run_code_cell"].description
+
+        timed_out = await core_tools["run_code_cell"].run(
+            {"cellId": "c_fail", "timeoutSeconds": 0}
+        )
+        assert timed_out.structured_content["timedOut"] is True
+        assert timed_out.structured_content["state"] == "running"
+        assert "get_cell_status" not in timed_out.structured_content["hint"]
+        assert "c_fail" in session._active_cell_executions_map(mock_proxy_client)
+
+        fail_gate.set()
+        await asyncio.sleep(0.02)
+        assert "c_fail" not in session._active_cell_executions_map(mock_proxy_client)
+
+    def test_merge_live_cell_state_combines_cdp_and_inflight(self):
+        merged = session._merge_live_cell_state(
+            {
+                "busy": False,
+                "queued": False,
+                "modelFound": True,
+                "domFound": False,
+                "source": "cdp-model",
+            },
+            {"cellId": "c1", "startedAt": 1.0},
+        )
+        assert merged == {
+            "busy": True,
+            "queued": False,
+            "source": "cdp-model+mcp-inflight",
+        }
+
+    @pytest.mark.asyncio
+    async def test_get_cell_status_falls_back_when_cdp_probe_times_out(
+        self, mock_proxy_client, monkeypatch
+    ):
+        monkeypatch.setattr(session, "_LIVE_CELL_PROBE_TIMEOUT_SECONDS", 0.01)
+
+        def slow_probe(_cell_ids):
+            import time as _time
+
+            _time.sleep(0.75)
+            return {"available": True, "kernelBusy": True, "cells": {}}
+
+        monkeypatch.setattr(
+            session, "_probe_colab_cell_runtime_states", slow_probe
+        )
+        active_map = session._active_cell_executions_map(mock_proxy_client)
+        active_map["c1"] = {"cellId": "c1", "startedAt": 1.0}
+        try:
+            status_tool = management_tool(mock_proxy_client, "get_cell_status")
+            status_tool._call_colab = AsyncMock(
+                return_value=tool_result(
+                    {"cells": [{"id": "c1", "cell_type": "code", "outputs": []}]}
+                )
+            )
+            res = await status_tool.run({"cellIds": ["c1"]})
+            assert res.structured_content["liveProbeAvailable"] is False
+            assert res.structured_content["cells"][0]["state"] == "running"
+            assert res.structured_content["cells"][0]["statusSource"] == "mcp-inflight"
+        finally:
+            active_map.pop("c1", None)
+
+    @pytest.mark.asyncio
+    async def test_management_call_colab_tracks_inflight_run_code_cell(
+        self, mock_proxy_client
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        gate = asyncio.Event()
+        seen_inflight = False
+
+        async def slow_upstream(name, args):
+            nonlocal seen_inflight
+            assert name == "run_code_cell"
+            assert args == {"cellId": "c_batch"}
+            seen_inflight = (
+                "c_batch" in session._active_cell_executions_map(mock_proxy_client)
+            )
+            await gate.wait()
+            return tool_result({"outputs": []})
+
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.side_effect = slow_upstream
+
+        batch_tool = management_tool(mock_proxy_client, "run_code_cells")
+        gate.set()
+        res = await batch_tool.run({"cellIds": ["c_batch"]})
+        assert seen_inflight is True
+        assert res.structured_content["cells"][0]["status"] == "success"
+        assert "c_batch" not in session._active_cell_executions_map(mock_proxy_client)
+
+    @pytest.mark.asyncio
+    async def test_get_cell_status_and_wait_for_cells_use_cdp_probe(
+        self, mock_proxy_client, monkeypatch
+    ):
+        probe_payloads = iter(
+            [
+                {
+                    "ok": True,
+                    "available": True,
+                    "kernelBusy": True,
+                    "cells": {
+                        "c1": {
+                            "busy": True,
+                            "queued": False,
+                            "modelFound": True,
+                            "domFound": True,
+                            "source": "cdp-both",
+                        },
+                        "c2": {
+                            "busy": False,
+                            "queued": True,
+                            "modelFound": True,
+                            "domFound": True,
+                            "source": "cdp-dom",
+                        },
+                    },
+                },
+                {
+                    "ok": True,
+                    "available": True,
+                    "kernelBusy": True,
+                    "cells": {
+                        "c1": {
+                            "busy": True,
+                            "queued": False,
+                            "modelFound": True,
+                            "domFound": True,
+                            "source": "cdp-model",
+                        },
+                    },
+                },
+                {
+                    "ok": True,
+                    "available": True,
+                    "kernelBusy": False,
+                    "cells": {
+                        "c1": {
+                            "busy": False,
+                            "queued": False,
+                            "modelFound": True,
+                            "domFound": True,
+                            "source": "cdp-model",
+                        },
+                    },
+                },
+            ]
+        )
+        monkeypatch.setattr(
+            session,
+            "_evaluate_colab_page",
+            lambda _expr: {"result": {"value": json.dumps(next(probe_payloads))}},
+        )
+
+        status_tool = management_tool(mock_proxy_client, "get_cell_status")
+        status_tool._call_colab = AsyncMock(
+            return_value=tool_result(
+                {
+                    "cells": [
+                        {
+                            "id": "c1",
+                            "cell_type": "code",
+                            "execution_count": 1,
+                            "outputs": [],
+                        },
+                        {"id": "c2", "cell_type": "code", "outputs": []},
+                    ]
+                }
+            )
+        )
+        status_res = await status_tool.run({"cellIds": ["c1", "c2"]})
+        assert status_res.structured_content["liveProbeAvailable"] is True
+        assert status_res.structured_content["kernelBusy"] is True
+        assert status_res.structured_content["cells"][0]["state"] == "running"
+        assert status_res.structured_content["cells"][0]["busy"] is True
+        assert status_res.structured_content["cells"][1]["state"] == "queued"
+        assert status_res.structured_content["cells"][1]["queued"] is True
+
+        wait_tool = management_tool(mock_proxy_client, "wait_for_cells")
+        wait_tool._call_colab = AsyncMock(
+            side_effect=[
+                tool_result(
+                    {
+                        "cells": [
+                            {
+                                "id": "c1",
+                                "cell_type": "code",
+                                "execution_count": 1,
+                                "outputs": [],
+                            }
+                        ]
+                    }
+                ),
+                tool_result(
+                    {
+                        "cells": [
+                            {
+                                "id": "c1",
+                                "cell_type": "code",
+                                "execution_count": 2,
+                                "outputs": [{"output_type": "stream", "text": "ok"}],
+                            }
+                        ]
+                    }
+                ),
+            ]
+        )
+        wait_res = await wait_tool.run(
+            {"cellIds": ["c1"], "timeoutSeconds": 2, "pollIntervalSeconds": 0.01}
+        )
+        assert wait_res.structured_content["timedOut"] is False
+        assert wait_res.structured_content["cells"][0]["state"] == "success"
+        assert wait_res.structured_content["cells"][0]["executionCount"] == 2
+        assert wait_tool._call_colab.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_run_code_cell_overlapping_executions_keep_inflight_until_all_finish(
+        self, mock_proxy_client
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        first_gate = asyncio.Event()
+        second_gate = asyncio.Event()
+        gates = iter([first_gate, second_gate])
+
+        async def staged_upstream(_name, _args):
+            gate = next(gates)
+            await gate.wait()
+            if gate is second_gate:
+                raise RuntimeError("second call rejected")
+            res = Mock()
+            res.content = [
+                session.TextContent(
+                    type="text",
+                    text=json.dumps({"execution_count": 1, "outputs": []}),
+                )
+            ]
+            res.structuredContent = {}
+            return res
+
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.side_effect = staged_upstream
+        tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(mock_proxy_client)
+        }
+        run_tool = tools["run_code_cell"]
+
+        res1 = await run_tool.run({"cellId": "c_dup", "timeoutSeconds": 0})
+        res2 = await run_tool.run({"cellId": "c_dup", "timeoutSeconds": 0})
+        assert res1.structured_content["state"] == "running"
+        assert res2.structured_content["state"] == "running"
+        assert "c_dup" in session._active_cell_executions_map(mock_proxy_client)
+
+        second_gate.set()
+        await asyncio.sleep(0.02)
+        assert "c_dup" in session._active_cell_executions_map(mock_proxy_client)
+
+        first_gate.set()
+        await asyncio.sleep(0.02)
+        assert "c_dup" not in session._active_cell_executions_map(mock_proxy_client)
+
+    @pytest.mark.asyncio
+    async def test_wait_for_cells_probes_live_state_before_get_cells_and_status_without_cell_ids(
+        self, mock_proxy_client, monkeypatch
+    ):
+        call_order: list[str] = []
+
+        def fake_probe(cell_ids):
+            call_order.append("probe")
+            return {
+                "available": True,
+                "kernelBusy": False,
+                "cells": {
+                    "c1": {
+                        "busy": False,
+                        "queued": False,
+                        "modelFound": True,
+                        "domFound": True,
+                        "source": "cdp-model",
+                    }
+                },
+            }
+
+        monkeypatch.setattr(session, "_probe_colab_cell_runtime_states", fake_probe)
+
+        wait_tool = management_tool(mock_proxy_client, "wait_for_cells")
+
+        async def fake_wait_call_colab(name, args):
+            call_order.append(name)
+            return tool_result(
+                {
+                    "cells": [
+                        {
+                            "id": "c1",
+                            "cell_type": "code",
+                            "execution_count": 3,
+                            "outputs": [{"output_type": "stream", "text": "done"}],
+                        }
+                    ]
+                }
+            )
+
+        wait_tool._call_colab = AsyncMock(side_effect=fake_wait_call_colab)
+        wait_res = await wait_tool.run(
+            {"cellIds": ["c1"], "timeoutSeconds": 1, "pollIntervalSeconds": 0.01}
+        )
+        assert wait_res.structured_content["timedOut"] is False
+        assert call_order == ["probe", "get_cells"]
+
+        call_order.clear()
+        status_tool = management_tool(mock_proxy_client, "get_cell_status")
+        status_tool._call_colab = AsyncMock(side_effect=fake_wait_call_colab)
+        status_res = await status_tool.run({})
+        assert call_order == ["probe", "get_cells"]
+        assert status_res.structured_content["cells"][0]["statusSource"] == "cdp-model"
+
+    @pytest.mark.asyncio
+    async def test_core_only_monitoring_via_read_cell_outputs_and_get_cells(
+        self, mock_proxy_client
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        finish_gate = asyncio.Event()
+
+        async def upstream_dispatch(name, args):
+            if name == "run_code_cell":
+                await finish_gate.wait()
+                return tool_result(
+                    {
+                        "execution_count": 2,
+                        "outputs": [{"output_type": "stream", "text": "epoch 2 done\n"}],
+                    }
+                )
+            if name == "get_cells":
+                return tool_result(
+                    {
+                        "cells": [
+                            {
+                                "id": "c_train",
+                                "cell_type": "code",
+                                "execution_count": 1,
+                                "source": ["train()"],
+                                "outputs": [
+                                    {"output_type": "stream", "text": "epoch 1...\n"}
+                                ],
+                            }
+                        ]
+                    }
+                )
+            raise AssertionError(f"Unexpected upstream tool: {name}")
+
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.side_effect = upstream_dispatch
+
+        static_tools = {
+            tool.name: tool
+            for tool in session.make_static_colab_proxy_tools(
+                mock_proxy_client, core_only=True
+            )
+        }
+        read_tool = management_tool(mock_proxy_client, "read_cell_outputs")
+
+        run_res = await static_tools["run_code_cell"].run(
+            {"cellId": "c_train", "timeoutSeconds": 0.01}
+        )
+        assert run_res.structured_content["timedOut"] is True
+        assert run_res.structured_content["state"] == "running"
+
+        # While still running, both read_cell_outputs and get_cells report running/busy
+        read_during = await read_tool.run({"cellIds": ["c_train"]})
+        assert read_during.structured_content["state"]["c_train"] == "running"
+        assert read_during.structured_content["busy"]["c_train"] is True
+
+        cells_during = await static_tools["get_cells"].run({})
+        cells_during_json = json.loads(cells_during.content[0].text)
+        assert cells_during_json["runningCellIds"] == ["c_train"]
+        assert cells_during_json["cells"][0]["state"] == "running"
+        assert cells_during_json["cells"][0]["busy"] is True
+
+        # Finish background execution
+        finish_gate.set()
+        await asyncio.sleep(0.02)
+
+        read_after = await read_tool.run({"cellIds": ["c_train"]})
+        assert read_after.structured_content["state"]["c_train"] == "success"
+        assert read_after.structured_content["busy"]["c_train"] is False
+
+        cells_after = await static_tools["get_cells"].run({})
+        cells_after_json = json.loads(cells_after.content[0].text)
+        assert "runningCellIds" not in cells_after_json
+        assert "busy" not in cells_after_json["cells"][0]
+
+    @pytest.mark.asyncio
+    async def test_clear_tracked_cell_executions_cancels_pending_tasks(
+        self, mock_proxy_client
+    ):
+        mock_proxy_client.is_connected.return_value = True
+        mock_proxy_client.proxy_mcp_client = AsyncMock()
+        never_event = asyncio.Event()
+
+        async def hang_forever(_name, _args):
+            await never_event.wait()
+
+        mock_proxy_client.proxy_mcp_client.call_tool_mcp.side_effect = hang_forever
+        task = session._start_tracked_cell_execution(
+            mock_proxy_client, "c_hang", {"cellId": "c_hang"}
+        )
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert "c_hang" in session._active_cell_executions_map(mock_proxy_client)
+
+        session._clear_tracked_cell_executions(mock_proxy_client, cancel=True)
+        await asyncio.sleep(0)
+        assert task.cancelled()
+        assert "c_hang" not in session._active_cell_executions_map(mock_proxy_client)
+
+    def test_cell_runtime_status_expression_guards_inactive_paper_spinner(self):
+        expr = session._cell_runtime_status_expression(["c1"])
+        assert "isPaperSpinner" in expr
+        assert "node.hasAttribute?.('active') || node.active === true" in expr
+        assert "entry.source === 'cdp-model' || entry.source === 'cdp-both'" in expr
+
+    def test_edge_cdp_call_passes_close_timeout(self, monkeypatch):
+        captured_kwargs = {}
+
+        class DummyWS:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def send(self, payload):
+                self._id = json.loads(payload)["id"]
+
+            def recv(self, timeout=None):
+                captured_kwargs["recv_timeout"] = timeout
+                return json.dumps({"id": self._id, "result": {"ok": True}})
+
+        def fake_connect(url, **kwargs):
+            captured_kwargs["url"] = url
+            captured_kwargs.update(kwargs)
+            return DummyWS()
+
+        monkeypatch.setattr(session, "websocket_connect", fake_connect)
+        res = session._edge_cdp_call(
+            "ws://127.0.0.1:9333/devtools/page/1",
+            "Runtime.evaluate",
+            {"expression": "1+1"},
+            timeout=0.5,
+        )
+        assert res == {"ok": True}
+        assert captured_kwargs["open_timeout"] == 0.5
+        assert captured_kwargs["close_timeout"] == 0.5
+        assert captured_kwargs["recv_timeout"] is not None
+        assert 0 < captured_kwargs["recv_timeout"] <= 0.5
 
 
 class TestCoreOnlyMode:

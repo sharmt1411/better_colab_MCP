@@ -114,6 +114,10 @@ uv run colab-mcp
   - 彻底杜绝执行包含大量输出的代码（如模型训练 Epoch、数据打印、依赖安装）时成千上万行日志瞬间击穿 Agent 上下文窗口的问题。
   - 单行超长日志同样享有 `maxLineChars`（默认 1000 字符）优雅折叠保护，并自动剥离 ANSI 颜色代码。
   - 附带明确的 `hint` 导航：如需查看完整输出或特定区间日志，可随时按需调用 `read_cell_outputs(cellIds=['...'])`。
+- **`run_code_cell` 非中断超时（`timeoutSeconds`）与实时单元格状态感知**：
+  - `run_code_cell` 支持可选的 `timeoutSeconds` 参数（`>= 0`）。当单元格执行时间超过 `timeoutSeconds` 时，工具基于 `asyncio.shield` 直接返回结构化的 `running` / `timedOut` 状态，**不会打断 Colab 前台正在运行的代码**。
+  - `get_cell_status` 与 `wait_for_cells` 融合了 Colab 浏览器 CDP 实时探测（同时检查 Notebook 模型/执行队列与 DOM 状态指示器）与 MCP 进程内 in-flight 执行追踪，彻底解决了传统快照无法识别 `running`/`queued` 状态或在重跑已有 `execution_count` 的单元格时误判已完成的痛点。
+  - `read_cell_outputs` 与 `get_cells` 同步透出 in-flight `state`/`busy`（及 `runningCellIds`），确保在 `--core-only` 精简模式下也能完整闭环监控前台长耗时单元格。
 - **`get_cells` 深度精简（默认排除输出）**：
   - 默认强制下发 `includeOutputs=False`，彻底从单元格数据中剥离冗长输出，避免因列出单元格导致 Agent 上下文瞬间被成千上万行日志撑爆。
   - 源代码数组自动拼接展平为标准的单段多行字符串，省去海量 JSON 转义与换行数组冗余。

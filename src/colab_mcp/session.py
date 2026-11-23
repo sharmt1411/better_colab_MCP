@@ -21,15 +21,19 @@ from contextlib import AsyncExitStack
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import threading
 import time
+from typing import Any
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 from itertools import count
 from fastmcp import FastMCP, Client
 from fastmcp.client.transports import ClientTransport
@@ -305,13 +309,27 @@ COLAB_STATIC_TOOL_SCHEMAS = {
         },
     },
     "run_code_cell": {
-        "description": "Executes the code in the cell with the provided cell ID. Returns the execution output summary (first 10 and last 10 lines by default, with line numbers and long-line truncation). If detailed or full output is needed, use read_cell_outputs.",
+        "description": (
+            "Executes the code in the cell with the provided cell ID. "
+            "Returns the execution output summary (first 10 and last 10 lines by default, with line numbers and long-line truncation). "
+            "If optional timeoutSeconds is provided and the cell is still running when the timeout expires, "
+            "returns a running/timedOut status without interrupting execution in Colab so you can monitor with get_cell_status and read_cell_outputs. "
+            "If detailed or full output is needed, use read_cell_outputs."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "cellId": {
                     "type": "string",
                     "description": "The ID of the code cell to execute.",
+                },
+                "timeoutSeconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": (
+                        "Optional maximum seconds to wait for completion before returning a running status "
+                        "(the cell continues running in the Colab foreground). Omit to wait until completion."
+                    ),
                 },
             },
             "required": ["cellId"],
@@ -788,7 +806,7 @@ COLAB_MANAGEMENT_TOOL_SCHEMAS = {
         },
     },
     "get_cell_status": {
-        "description": "Returns best-effort execution status for selected cells or all cells.",
+        "description": "Returns execution status for selected cells or all cells, combining live Colab browser CDP state and in-flight MCP execution tracking with notebook cell metadata.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1192,6 +1210,7 @@ class ColabProxyClient:
         self._stopped = False
         self._connection_lock = asyncio.Lock()
         self._client_ready = asyncio.Event()
+        self._active_cell_executions: dict[str, dict[str, Any]] = {}
 
     def is_connected(self):
         client_live = True
@@ -1316,6 +1335,7 @@ class ColabProxyClient:
                                 await asyncio.wait_for(old_stack.aclose(), timeout=2.0)
                             except Exception:
                                 pass
+                        _clear_tracked_cell_executions(self, cancel=True)
 
             except asyncio.CancelledError:
                 break
@@ -1345,11 +1365,458 @@ class ColabProxyClient:
         await self._exit_stack.aclose()
         self.proxy_mcp_client = None
         self._client_ready.clear()
+        _clear_tracked_cell_executions(self, cancel=True)
+
+
+_ACTIVE_CELL_EXECUTIONS_FALLBACK: weakref.WeakKeyDictionary[
+    object, dict[str, dict]
+] = weakref.WeakKeyDictionary()
+_BACKGROUND_CELL_TASKS: set[asyncio.Task] = set()
+
+
+def _active_cell_executions_map(proxy_client: object) -> dict[str, dict]:
+    mapping = getattr(proxy_client, "_active_cell_executions", None)
+    if isinstance(mapping, dict):
+        return mapping
+    mapping = _ACTIVE_CELL_EXECUTIONS_FALLBACK.get(proxy_client)
+    if mapping is None:
+        mapping = {}
+        _ACTIVE_CELL_EXECUTIONS_FALLBACK[proxy_client] = mapping
+    return mapping
+
+
+def _clear_tracked_cell_executions(
+    proxy_client: object, *, cancel: bool = False
+) -> None:
+    active_map = _active_cell_executions_map(proxy_client)
+    if cancel:
+        for entry in list(active_map.values()):
+            if not isinstance(entry, dict):
+                continue
+            tasks = entry.get("tasks")
+            if isinstance(tasks, set):
+                for task in list(tasks):
+                    if isinstance(task, asyncio.Task) and not task.done():
+                        task.cancel()
+            else:
+                task = entry.get("task")
+                if isinstance(task, asyncio.Task) and not task.done():
+                    task.cancel()
+    active_map.clear()
+
+
+def _start_tracked_cell_execution(
+    proxy_client: object, cell_id: str | None, upstream_args: dict
+) -> asyncio.Task:
+    """Run upstream run_code_cell in a shielded task and track it while in flight."""
+    coro = proxy_client.proxy_mcp_client.call_tool_mcp(
+        "run_code_cell", upstream_args
+    )
+    task = asyncio.create_task(coro)
+    _BACKGROUND_CELL_TASKS.add(task)
+
+    active_map = _active_cell_executions_map(proxy_client) if cell_id else None
+    entry: dict[str, Any] | None = None
+    if cell_id and active_map is not None:
+        existing = active_map.get(cell_id)
+        tasks: set[asyncio.Task] = set()
+        if isinstance(existing, dict):
+            existing_tasks = existing.get("tasks")
+            if isinstance(existing_tasks, set):
+                tasks.update(existing_tasks)
+            elif existing.get("task") is not None:
+                tasks.add(existing["task"])
+        tasks.add(task)
+        entry = {
+            "cellId": cell_id,
+            "task": task,
+            "tasks": tasks,
+            "startedAt": (
+                existing.get("startedAt", time.time())
+                if isinstance(existing, dict)
+                else time.time()
+            ),
+        }
+        active_map[cell_id] = entry
+
+    def _cleanup(done_task: asyncio.Task) -> None:
+        _BACKGROUND_CELL_TASKS.discard(done_task)
+        if cell_id and active_map is not None:
+            current = active_map.get(cell_id)
+            if isinstance(current, dict):
+                current_tasks = current.get("tasks")
+                if isinstance(current_tasks, set):
+                    current_tasks.discard(done_task)
+                    if not current_tasks:
+                        active_map.pop(cell_id, None)
+                elif current is entry:
+                    active_map.pop(cell_id, None)
+        if not done_task.cancelled():
+            try:
+                exc = done_task.exception()
+                if exc is not None:
+                    logging.debug(
+                        "Background run_code_cell execution for cell %s failed: %s",
+                        cell_id,
+                        exc,
+                    )
+            except Exception:
+                pass
+
+    task.add_done_callback(_cleanup)
+    return task
+
+
+def _cell_runtime_status_expression(cell_ids: list[str] | None = None) -> str:
+    """Build JS expression that inspects Colab notebook model and DOM for live cell states."""
+    target_json = json.dumps(cell_ids)
+    return f"""
+JSON.stringify((() => {{
+  const targetList = {target_json};
+  const targetSet = Array.isArray(targetList) ? new Set(targetList) : null;
+  const notebook = window.colab?.global?.notebook;
+  const kernel = notebook?.kernel || notebook?.getKernel?.();
+  const kernelStatusText = String(kernel?.status ?? kernel?.executionState ?? '').toLowerCase();
+  let kernelBusy = null;
+  try {{
+    const kb = kernel?.isBusy?.() ?? kernel?.busy ?? kernel?.isExecuting?.() ?? kernel?.executing;
+    if (typeof kb === 'boolean') {{
+      kernelBusy = kb;
+    }} else if (/busy|running|executing/.test(kernelStatusText)) {{
+      kernelBusy = true;
+    }} else if (/idle|ready/.test(kernelStatusText)) {{
+      kernelBusy = false;
+    }}
+  }} catch (_err) {{}}
+
+  const queuedIds = new Set();
+  const collectQueueIds = (queueLike) => {{
+    if (!queueLike) return;
+    const items = Array.isArray(queueLike)
+      ? queueLike
+      : (typeof queueLike?.values === 'function' ? Array.from(queueLike.values()) : []);
+    for (const item of items) {{
+      if (typeof item === 'string') {{
+        queuedIds.add(item);
+      }} else if (item && typeof item === 'object') {{
+        const qid = item?.getId?.() ?? item?.id ?? item?.cellId ?? item?.cell?.getId?.() ?? item?.cell?.id;
+        if (typeof qid === 'string' && qid) queuedIds.add(qid);
+      }}
+    }}
+  }};
+  try {{
+    collectQueueIds(notebook?.executionQueue);
+    collectQueueIds(notebook?.queuedCells);
+    collectQueueIds(kernel?.executionQueue);
+  }} catch (_err) {{}}
+
+  const cells = {{}};
+  const ensureEntry = (id) => {{
+    if (!cells[id]) {{
+      cells[id] = {{
+        busy: false,
+        queued: false,
+        modelFound: false,
+        domFound: false,
+        source: 'cdp-none',
+      }};
+    }}
+    return cells[id];
+  }};
+
+  try {{
+    const modelCells = Array.isArray(notebook?.cells)
+      ? notebook.cells
+      : (typeof notebook?.getCells === 'function' ? notebook.getCells() : []);
+    for (const cell of modelCells || []) {{
+      const id = cell?.getId?.() ?? cell?.id ?? cell?.cellId ?? cell?.model?.id;
+      if (typeof id !== 'string' || !id) continue;
+      if (targetSet && !targetSet.has(id)) continue;
+      const entry = ensureEntry(id);
+      entry.modelFound = true;
+      let execStatus = '';
+      try {{
+        const info = cell?.getExecutionInfo?.() || cell?.executionInfo || cell?.model?.executionInfo;
+        execStatus = String(
+          info?.status ?? cell?.executionState ?? cell?.status ?? cell?.model?.executionState ?? ''
+        ).toLowerCase();
+      }} catch (_err) {{}}
+      const isRunning = Boolean(
+        cell?.isRunning?.() ||
+        cell?.running ||
+        cell?.isExecuting?.() ||
+        cell?.executing ||
+        cell?.model?.isRunning?.() ||
+        cell?.model?.running ||
+        ['running', 'busy', 'executing'].includes(execStatus)
+      );
+      const isQueued = Boolean(
+        cell?.isQueued?.() ||
+        cell?.queued ||
+        cell?.isPending?.() ||
+        cell?.pending ||
+        cell?.model?.isQueued?.() ||
+        cell?.model?.queued ||
+        ['queued', 'pending', 'waiting'].includes(execStatus) ||
+        queuedIds.has(id)
+      );
+      if (isRunning) entry.busy = true;
+      if (isQueued && !entry.busy) entry.queued = true;
+      if (entry.busy || entry.queued) entry.source = 'cdp-model';
+    }}
+  }} catch (_err) {{}}
+
+  const isIgnoredSubtree = (node) => {{
+    if (!node || node.nodeType !== Node.ELEMENT_NODE) return false;
+    const tag = node.tagName || '';
+    if (
+      tag === 'COLAB-OUTPUT' ||
+      tag === 'IFRAME' ||
+      tag === 'MONACO-EDITOR' ||
+      tag === 'CM-EDITOR'
+    ) {{
+      return true;
+    }}
+    const cls = node.classList;
+    if (!cls) return false;
+    return (
+      cls.contains('output-area') ||
+      cls.contains('output_area') ||
+      cls.contains('output-content') ||
+      cls.contains('output_wrapper') ||
+      cls.contains('monaco-editor') ||
+      cls.contains('cm-editor') ||
+      cls.contains('CodeMirror')
+    );
+  }};
+
+  const allDeep = (root = document) => {{
+    const nodes = [];
+    const walk = (node) => {{
+      if (!node) return;
+      if (node.nodeType === Node.ELEMENT_NODE) {{
+        if (node !== root && isIgnoredSubtree(node)) return;
+        nodes.push(node);
+        if (node.shadowRoot) walk(node.shadowRoot);
+      }}
+      for (const child of node.children || []) walk(child);
+    }};
+    walk(root);
+    return nodes;
+  }};
+
+  const resolveCellDomId = (el) => {{
+    const rawId = el?.getAttribute?.('data-cell-id') || el?.getAttribute?.('cell-id') || el?.cellId || '';
+    if (typeof rawId === 'string' && rawId) return rawId;
+    const domId = el?.id || '';
+    if (typeof domId === 'string' && domId.startsWith('cell-') && domId.length > 5) {{
+      return domId.slice(5);
+    }}
+    return null;
+  }};
+
+  const runningLabelRe = /\\b(interrupt|stop)\\b|cancel execution|中断|停止执行|正在执行/i;
+  const queuedLabelRe = /\\b(queued|pending)\\b|cancel queued|排队|已排队/i;
+
+  try {{
+    for (const el of allDeep(document)) {{
+      const tag = el.tagName || '';
+      if (tag !== 'COLAB-CELL' && !el.id?.startsWith('cell-') && !el.hasAttribute?.('data-cell-id')) {{
+        continue;
+      }}
+      const id = resolveCellDomId(el);
+      if (!id) continue;
+      if (targetSet && !targetSet.has(id)) continue;
+
+      const entry = ensureEntry(id);
+      entry.domFound = true;
+      const subNodes = allDeep(el).filter((node) => node === el || !resolveCellDomId(node));
+      let domRunning = false;
+      let domQueued = false;
+
+      const checkClassesAndAttrs = (node) => {{
+        const cls = node.classList;
+        if (
+          node.running === true ||
+          node.executing === true ||
+          node.hasAttribute?.('running') ||
+          node.hasAttribute?.('executing') ||
+          node.getAttribute?.('aria-busy') === 'true' ||
+          node.getAttribute?.('data-running') === 'true' ||
+          cls?.contains('running') ||
+          cls?.contains('executing')
+        ) {{
+          domRunning = true;
+        }}
+        if (
+          node.queued === true ||
+          node.pending === true ||
+          node.hasAttribute?.('queued') ||
+          node.hasAttribute?.('pending') ||
+          node.getAttribute?.('data-queued') === 'true' ||
+          cls?.contains('queued') ||
+          cls?.contains('pending')
+        ) {{
+          domQueued = true;
+        }}
+      }};
+
+      checkClassesAndAttrs(el);
+      for (const node of subNodes) {{
+        const nodeTag = node.tagName || '';
+        if (nodeTag === 'COLAB-RUN-BUTTON' || nodeTag === 'BUTTON' || node.getAttribute?.('role') === 'button') {{
+          checkClassesAndAttrs(node);
+          const isEnabled =
+            node.disabled !== true &&
+            node.getAttribute?.('aria-disabled') !== 'true' &&
+            !node.hasAttribute?.('hidden') &&
+            node.style?.display !== 'none';
+          const rect = node.getBoundingClientRect?.();
+          const isVisibleButton =
+            nodeTag === 'COLAB-RUN-BUTTON' ||
+            (rect && rect.width > 0 && rect.height > 0);
+          if (isEnabled && isVisibleButton) {{
+            const lbl = (
+              node.getAttribute?.('aria-label') ||
+              node.getAttribute?.('title') ||
+              ''
+            ).trim();
+            if (lbl) {{
+              if (queuedLabelRe.test(lbl)) {{
+                domQueued = true;
+              }} else if (runningLabelRe.test(lbl)) {{
+                domRunning = true;
+              }}
+            }}
+          }}
+        }} else if (
+          nodeTag === 'PAPER-SPINNER' ||
+          nodeTag === 'PAPER-SPINNER-LITE' ||
+          nodeTag === 'MD-CIRCULAR-PROGRESS' ||
+          node.getAttribute?.('role') === 'progressbar'
+        ) {{
+          const isPaperSpinner =
+            nodeTag === 'PAPER-SPINNER' || nodeTag === 'PAPER-SPINNER-LITE';
+          const isSpinnerActive = isPaperSpinner
+            ? (node.hasAttribute?.('active') || node.active === true)
+            : (node.getAttribute?.('aria-hidden') !== 'true' && !node.hasAttribute?.('hidden'));
+          if (isSpinnerActive) {{
+            const style =
+              typeof window.getComputedStyle === 'function'
+                ? window.getComputedStyle(node)
+                : null;
+            const isStyleVisible =
+              !style ||
+              (style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0');
+            const rect = node.getBoundingClientRect?.();
+            if (isStyleVisible && rect && rect.width > 0 && rect.height > 0) {{
+              domRunning = true;
+            }}
+          }}
+        }}
+      }}
+
+      if (domRunning) {{
+        entry.busy = true;
+        entry.queued = false;
+      }}
+      if (domQueued && !entry.busy) entry.queued = true;
+      if (domRunning || domQueued) {{
+        entry.source =
+          entry.source === 'cdp-model' || entry.source === 'cdp-both'
+            ? 'cdp-both'
+            : 'cdp-dom';
+      }} else if (entry.source === 'cdp-none') {{
+        entry.source = entry.modelFound ? 'cdp-model' : 'cdp-dom';
+      }}
+    }}
+  }} catch (_err) {{}}
+
+  for (const entry of Object.values(cells)) {{
+    if (entry.source === 'cdp-none' && entry.modelFound) {{
+      entry.source = 'cdp-model';
+    }}
+  }}
+
+  return {{
+    ok: true,
+    available: Boolean(notebook || Object.keys(cells).length > 0),
+    kernelBusy,
+    cells,
+  }};
+}})())
+"""
+
+
+_CDP_THREAD_LOCAL = threading.local()
+_LIVE_CELL_PROBE_TIMEOUT_SECONDS = 2.0
+
+
+def _probe_colab_cell_runtime_states(cell_ids: list[str] | None = None) -> dict:
+    """Best-effort CDP probe of live cell running/queued states from Colab browser."""
+    previous_timeout = getattr(_CDP_THREAD_LOCAL, "cdp_timeout", None)
+    _CDP_THREAD_LOCAL.cdp_timeout = _LIVE_CELL_PROBE_TIMEOUT_SECONDS
+    try:
+        evaluation = _evaluate_colab_page(_cell_runtime_status_expression(cell_ids))
+        if not isinstance(evaluation, dict) or "exceptionDetails" in evaluation:
+            return {"available": False, "kernelBusy": None, "cells": {}}
+        raw = evaluation.get("result", {}).get("value")
+        if not isinstance(raw, str):
+            return {"available": False, "kernelBusy": None, "cells": {}}
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or not parsed.get("available"):
+            return {"available": False, "kernelBusy": parsed.get("kernelBusy") if isinstance(parsed, dict) else None, "cells": {}}
+        return {
+            "available": True,
+            "kernelBusy": parsed.get("kernelBusy"),
+            "cells": parsed.get("cells") or {},
+        }
+    except Exception as exc:
+        logging.debug("Live Colab cell status CDP probe failed: %s", exc)
+        return {"available": False, "kernelBusy": None, "cells": {}}
+    finally:
+        if previous_timeout is None:
+            _CDP_THREAD_LOCAL.__dict__.pop("cdp_timeout", None)
+        else:
+            _CDP_THREAD_LOCAL.cdp_timeout = previous_timeout
+
+
+def _merge_live_cell_state(
+    cdp_state: dict | None,
+    inflight_entry: dict | None,
+) -> dict | None:
+    """Combine CDP live state and in-flight MCP call tracking for one cell."""
+    if cdp_state is None and inflight_entry is None:
+        return None
+    cdp_busy = bool(cdp_state.get("busy")) if isinstance(cdp_state, dict) else False
+    cdp_queued = bool(cdp_state.get("queued")) if isinstance(cdp_state, dict) else False
+    inflight_busy = inflight_entry is not None
+    busy = cdp_busy or inflight_busy
+    queued = cdp_queued and not busy
+
+    sources: list[str] = []
+    if isinstance(cdp_state, dict):
+        cdp_source = cdp_state.get("source")
+        if cdp_source and cdp_source != "cdp-none":
+            sources.append(str(cdp_source))
+        elif cdp_state.get("modelFound") or cdp_state.get("domFound"):
+            sources.append("cdp")
+    if inflight_busy:
+        sources.append("mcp-inflight")
+
+    return {
+        "busy": busy,
+        "queued": queued,
+        "source": "+".join(sources) if sources else "notebook-snapshot",
+    }
 
 
 class StaticColabProxyTool(Tool):
     _proxy_client: ColabProxyClient = PrivateAttr()
     _upstream_name: str = PrivateAttr()
+    _core_only: bool = PrivateAttr(default=False)
 
     def __init__(
         self,
@@ -1358,6 +1825,7 @@ class StaticColabProxyTool(Tool):
         upstream_name: str,
         description: str,
         parameters: dict,
+        core_only: bool = False,
     ):
         super().__init__(
             name=upstream_name,
@@ -1367,6 +1835,7 @@ class StaticColabProxyTool(Tool):
         )
         self._proxy_client = proxy_client
         self._upstream_name = upstream_name
+        self._core_only = core_only
 
     async def run(self, arguments: dict) -> ToolResult:
         if not self._proxy_client.is_connected():
@@ -1383,13 +1852,86 @@ class StaticColabProxyTool(Tool):
         if self._upstream_name == "get_cells":
             call_args.setdefault("includeOutputs", False)
 
-        result = await self._proxy_client.proxy_mcp_client.call_tool_mcp(
-            self._upstream_name, call_args
-        )
+        if self._upstream_name == "run_code_cell":
+            timeout_raw = call_args.pop("timeoutSeconds", None)
+            timeout_seconds: float | None = None
+            if timeout_raw is not None:
+                if isinstance(timeout_raw, bool):
+                    raise ValueError(
+                        "timeoutSeconds must be a finite number >= 0"
+                    )
+                timeout_seconds = float(timeout_raw)
+                if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
+                    raise ValueError(
+                        "timeoutSeconds must be a finite number >= 0"
+                    )
+
+            cell_id = call_args.get("cellId")
+            task = _start_tracked_cell_execution(
+                self._proxy_client, cell_id, call_args
+            )
+            try:
+                if timeout_seconds is None:
+                    result = await asyncio.shield(task)
+                else:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(task), timeout=timeout_seconds
+                    )
+            except asyncio.TimeoutError:
+                monitor_hint = (
+                    f"Use read_cell_outputs(cellIds=['{cell_id}']) or get_cells() to monitor progress."
+                    if self._core_only
+                    else (
+                        f"Use get_cell_status(cellIds=['{cell_id}']) and "
+                        f"read_cell_outputs(cellIds=['{cell_id}']) to monitor progress."
+                    )
+                )
+                timeout_payload = {
+                    "cellId": cell_id,
+                    "state": "running",
+                    "busy": True,
+                    "queued": False,
+                    "timedOut": True,
+                    "timeoutSeconds": timeout_seconds,
+                    "status": "running",
+                    "hint": (
+                        f"Cell '{cell_id}' is still running in the Colab foreground after "
+                        f"{timeout_seconds:g}s (execution was NOT interrupted). "
+                        f"{monitor_hint}"
+                    ),
+                }
+                return ToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=json.dumps(
+                                timeout_payload, ensure_ascii=False, indent=2
+                            ),
+                        )
+                    ],
+                    structured_content={
+                        **timeout_payload,
+                        "ok": True,
+                        "warnings": [],
+                    },
+                )
+        else:
+            inflight_before_call = (
+                set(_active_cell_executions_map(self._proxy_client).keys())
+                if self._upstream_name == "get_cells"
+                else set()
+            )
+            result = await self._proxy_client.proxy_mcp_client.call_tool_mcp(
+                self._upstream_name, call_args
+            )
         structured_content = getattr(result, "structuredContent", None)
-        if structured_content is None:
+        if not isinstance(structured_content, Mapping):
             structured_content = getattr(result, "structured_content", None)
-        structured_content = dict(structured_content or {})
+        structured_content = (
+            dict(structured_content)
+            if isinstance(structured_content, Mapping)
+            else {}
+        )
         warnings = structured_content.get("warnings") or []
         if structured_content.get("warning"):
             warnings = [*warnings, structured_content["warning"]]
@@ -1407,8 +1949,12 @@ class StaticColabProxyTool(Tool):
                 raw_text = content_items[0].text
                 data = json.loads(raw_text)
                 if isinstance(data, dict) and "cells" in data:
+                    inflight_ids = inflight_before_call | set(
+                        _active_cell_executions_map(self._proxy_client).keys()
+                    )
                     raw_cells = data.get("cells", [])
                     cleaned_cells = []
+                    running_cell_ids = []
                     for cell in raw_cells:
                         clean_cell = dict(cell)
                         src = clean_cell.get("source", "")
@@ -1432,11 +1978,19 @@ class StaticColabProxyTool(Tool):
                             clean_cell["hasOutputs"] = output_count > 0
                             clean_cell["outputCount"] = output_count
 
+                        cell_id = clean_cell.get("id")
+                        if cell_id and cell_id in inflight_ids:
+                            clean_cell["state"] = "running"
+                            clean_cell["busy"] = True
+                            running_cell_ids.append(cell_id)
+
                         cleaned_cells.append(clean_cell)
 
                     data["cells"] = cleaned_cells
                     data["cellCount"] = len(cleaned_cells)
                     data["includeOutputs"] = include_outputs
+                    if running_cell_ids:
+                        data["runningCellIds"] = running_cell_ids
                     if not include_outputs:
                         data["hint"] = "Outputs are excluded by default to conserve context. Use read_cell_outputs(cellIds=['<id>']) to view outputs."
 
@@ -1448,6 +2002,8 @@ class StaticColabProxyTool(Tool):
                         "cellCount": len(cleaned_cells),
                         "includeOutputs": include_outputs,
                     })
+                    if running_cell_ids:
+                        structured_content["runningCellIds"] = running_cell_ids
             except Exception as exc:
                 logging.debug("Failed to post-process get_cells output: %s", exc)
 
@@ -1559,6 +2115,11 @@ class ColabRuntimeManagementTool(Tool):
             raise RuntimeError(
                 "Colab UI is not connected. Call open_colab_browser_connection first."
             )
+        if name == "run_code_cell":
+            task = _start_tracked_cell_execution(
+                self._proxy_client, arguments.get("cellId"), arguments
+            )
+            return await asyncio.shield(task)
         last_exc = None
         for attempt in range(3):
             try:
@@ -1584,11 +2145,28 @@ class ColabRuntimeManagementTool(Tool):
         return source or ""
 
     @staticmethod
-    def _cell_status(cell: dict, index: int) -> dict:
+    def _cell_status(
+        cell: dict, index: int, live_state: dict | None = None
+    ) -> dict:
         outputs = cell.get("outputs") or []
         has_error = any(output.get("output_type") == "error" for output in outputs)
         execution_count = cell.get("execution_count")
-        if has_error:
+        busy = bool(live_state.get("busy")) if isinstance(live_state, dict) else False
+        queued = (
+            bool(live_state.get("queued")) and not busy
+            if isinstance(live_state, dict)
+            else False
+        )
+        status_source = (
+            str(live_state.get("source") or "notebook-snapshot")
+            if isinstance(live_state, dict)
+            else "notebook-snapshot"
+        )
+        if busy:
+            state = "running"
+        elif queued:
+            state = "queued"
+        elif has_error:
             state = "error"
         elif execution_count is not None:
             state = "success"
@@ -1606,13 +2184,44 @@ class ColabRuntimeManagementTool(Tool):
             "index": index,
             "cellType": cell.get("cell_type"),
             "state": state,
-            "busy": False,
-            "queued": False,
+            "busy": busy,
+            "queued": queued,
+            "statusSource": status_source,
             "executionCount": execution_count,
             "hasError": has_error,
             "lastOutputText": last_output_text,
             "outputCount": len(outputs),
             "outputs": outputs,
+        }
+
+    async def _collect_live_cell_states(
+        self, cell_ids: list[str] | None
+    ) -> tuple[dict[str, dict], dict]:
+        try:
+            probe = await asyncio.wait_for(
+                asyncio.to_thread(_probe_colab_cell_runtime_states, cell_ids),
+                timeout=_LIVE_CELL_PROBE_TIMEOUT_SECONDS + 0.5,
+            )
+        except Exception as exc:
+            logging.debug("Timed out or failed collecting live cell states: %s", exc)
+            probe = {"available": False, "kernelBusy": None, "cells": {}}
+        cdp_cells = probe.get("cells") or {}
+        inflight_map = _active_cell_executions_map(self._proxy_client)
+        target_ids = (
+            cell_ids
+            if cell_ids is not None
+            else list({*cdp_cells.keys(), *inflight_map.keys()})
+        )
+        merged: dict[str, dict] = {}
+        for cell_id in target_ids:
+            live = _merge_live_cell_state(
+                cdp_cells.get(cell_id), inflight_map.get(cell_id)
+            )
+            if live is not None:
+                merged[cell_id] = live
+        return merged, {
+            "available": bool(probe.get("available")),
+            "kernelBusy": probe.get("kernelBusy"),
         }
 
     @staticmethod
@@ -2499,19 +3108,21 @@ class ColabRuntimeManagementTool(Tool):
             timeout_seconds = float(arguments.get("timeoutSeconds", 60))
             interval = float(arguments.get("pollIntervalSeconds", 0.5))
             target_states = set(arguments.get("targetStates", ["success", "error"]))
-            cell_ids = set(arguments["cellIds"])
+            cell_ids = list(arguments["cellIds"])
+            cell_id_set = set(cell_ids)
             deadline = asyncio.get_running_loop().time() + timeout_seconds
             statuses = []
             timed_out = False
             while True:
+                live_states, _ = await self._collect_live_cell_states(cell_ids)
                 cells_result = await self._call_colab(
                     "get_cells", {"includeOutputs": True}
                 )
                 cells = json.loads(self._result_text(cells_result))["cells"]
                 statuses = [
-                    self._cell_status(cell, index)
+                    self._cell_status(cell, index, live_states.get(cell.get("id")))
                     for index, cell in enumerate(cells)
-                    if cell.get("id") in cell_ids
+                    if cell.get("id") in cell_id_set
                 ]
                 if statuses and all(
                     status["state"] in target_states for status in statuses
@@ -2550,6 +3161,9 @@ class ColabRuntimeManagementTool(Tool):
                 "watch_cell_outputs",
             }:
                 include_outputs = True
+            inflight_before_cells = set(
+                _active_cell_executions_map(self._proxy_client).keys()
+            )
             if self.name == "watch_cell_outputs":
                 deadline = asyncio.get_running_loop().time() + float(
                     arguments.get("timeoutSeconds", 10)
@@ -2557,6 +3171,9 @@ class ColabRuntimeManagementTool(Tool):
                 interval = float(arguments.get("pollIntervalSeconds", 0.5))
                 latest_cells = []
                 while True:
+                    inflight_before_cells = set(
+                        _active_cell_executions_map(self._proxy_client).keys()
+                    )
                     cells_result = await self._call_colab(
                         "get_cells", {"includeOutputs": True}
                     )
@@ -2566,6 +3183,13 @@ class ColabRuntimeManagementTool(Tool):
                     await asyncio.sleep(interval)
                 cells = latest_cells
             else:
+                live_states: dict[str, dict] = {}
+                probe_meta = {"available": False, "kernelBusy": None}
+                if self.name == "get_cell_status":
+                    requested_cell_ids = arguments.get("cellIds") or None
+                    live_states, probe_meta = await self._collect_live_cell_states(
+                        requested_cell_ids
+                    )
                 cells_result = await self._call_colab(
                     "get_cells", {"includeOutputs": include_outputs}
                 )
@@ -2590,23 +3214,30 @@ class ColabRuntimeManagementTool(Tool):
                 raise ValueError(f"Cell(s) not found: {missing_ids}")
             if self.name == "get_cell_status":
                 statuses = [
-                    self._cell_status(by_id[cell_id][1], by_id[cell_id][0])
+                    self._cell_status(
+                        by_id[cell_id][1],
+                        by_id[cell_id][0],
+                        live_states.get(cell_id),
+                    )
                     for cell_id in cell_ids
                     if cell_id in by_id
                 ]
                 if not bool(arguments.get("includeOutputs", False)):
                     for status in statuses:
                         status.pop("outputs", None)
+                payload = {
+                    "cells": statuses,
+                    "liveProbeAvailable": probe_meta["available"],
+                    "kernelBusy": probe_meta["kernelBusy"],
+                }
                 return ToolResult(
                     content=[
                         TextContent(
                             type="text",
-                            text=json.dumps(
-                                {"cells": statuses}, ensure_ascii=False, indent=2
-                            ),
+                            text=json.dumps(payload, ensure_ascii=False, indent=2),
                         )
                     ],
-                    structured_content={"cells": statuses},
+                    structured_content=payload,
                 )
             max_bytes = int(arguments.get("maxBytes", 20000))
             normalize = bool(arguments.get("normalize", False))
@@ -2621,14 +3252,30 @@ class ColabRuntimeManagementTool(Tool):
                 for cell_id in cell_ids
                 if cell_id in by_id
             }
+            inflight_ids = inflight_before_cells | set(
+                _active_cell_executions_map(self._proxy_client).keys()
+            )
 
             tailed_outputs = {}
             tailed_chunks = {}
             tail_texts = {}
             total_lines_map = {}
             returned_lines_map = {}
+            cell_states = {}
+            busy_map = {}
 
             for cell_id, cell_outputs in raw_outputs.items():
+                cell_index, cell_obj = by_id[cell_id]
+                inflight_live = (
+                    {"busy": True, "queued": False, "source": "mcp-inflight"}
+                    if cell_id in inflight_ids
+                    else None
+                )
+                status_info = self._cell_status(
+                    cell_obj, cell_index, inflight_live
+                )
+                cell_states[cell_id] = status_info["state"]
+                busy_map[cell_id] = status_info["busy"]
                 norm_chunks = self._normalize_outputs(cell_outputs)
                 chunks_tailed, tail_text, total_lines = self._tail_chunks_and_text(
                     norm_chunks, lines, max_line_chars=max_line_chars
@@ -2649,6 +3296,8 @@ class ColabRuntimeManagementTool(Tool):
                 "tailText": tail_texts,
                 "totalLines": total_lines_map,
                 "returnedLines": returned_lines_map,
+                "state": cell_states,
+                "busy": busy_map,
             }
             if include_raw:
                 payload["outputs"] = tailed_outputs
@@ -2664,6 +3313,8 @@ class ColabRuntimeManagementTool(Tool):
                 "tailText": tail_texts,
                 "totalLines": total_lines_map,
                 "returnedLines": returned_lines_map,
+                "state": cell_states,
+                "busy": busy_map,
                 "truncated": truncated,
             }
             if include_raw:
@@ -3506,16 +4157,29 @@ def make_static_colab_proxy_tools(
     *,
     core_only: bool = False,
 ) -> list[Tool]:
-    return [
-        StaticColabProxyTool(
-            proxy_client=proxy_client,
-            upstream_name=name,
-            description=spec["description"],
-            parameters=deepcopy(spec["parameters"]),
+    tools: list[Tool] = []
+    for name, spec in COLAB_STATIC_TOOL_SCHEMAS.items():
+        if core_only and name not in CORE_TOOL_NAMES:
+            continue
+        description = spec["description"]
+        if core_only and name == "run_code_cell":
+            description = (
+                "Executes the code in the cell with the provided cell ID. "
+                "Returns the execution output summary (first 10 and last 10 lines by default, with line numbers and long-line truncation). "
+                "If optional timeoutSeconds is provided and the cell is still running when the timeout expires, "
+                "returns a running/timedOut status without interrupting execution in Colab so you can monitor with read_cell_outputs or get_cells. "
+                "If detailed or full output is needed, use read_cell_outputs."
+            )
+        tools.append(
+            StaticColabProxyTool(
+                proxy_client=proxy_client,
+                upstream_name=name,
+                description=description,
+                parameters=deepcopy(spec["parameters"]),
+                core_only=core_only,
+            )
         )
-        for name, spec in COLAB_STATIC_TOOL_SCHEMAS.items()
-        if not core_only or name in CORE_TOOL_NAMES
-    ]
+    return tools
 
 
 def make_colab_management_tools(
@@ -3700,9 +4364,14 @@ async def check_session_proxy_tool_fn(
     return _navigate_controlled_edge(url, token=token, mcp_port=port)
 
 
-def _cdp_json(url: str, *, method: str = "GET"):
+def _cdp_json(url: str, *, method: str = "GET", timeout: float | None = None):
+    effective_timeout = (
+        timeout
+        if timeout is not None
+        else getattr(_CDP_THREAD_LOCAL, "cdp_timeout", 2)
+    )
     request = urllib.request.Request(url, method=method)
-    with urllib.request.urlopen(request, timeout=2) as response:
+    with urllib.request.urlopen(request, timeout=effective_timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -5402,13 +6071,48 @@ def _edge_cdp_eval(websocket_url: str, expression: str, *, await_promise: bool =
     )
 
 
-def _edge_cdp_call(websocket_url: str, method: str, params: dict):
+def _edge_cdp_call(
+    websocket_url: str,
+    method: str,
+    params: dict,
+    *,
+    timeout: float | None = None,
+):
+    effective_timeout = (
+        timeout
+        if timeout is not None
+        else getattr(_CDP_THREAD_LOCAL, "cdp_timeout", None)
+    )
+    open_timeout = (
+        min(2.0, float(effective_timeout))
+        if effective_timeout is not None
+        else 2
+    )
+    close_timeout = (
+        min(1.0, float(effective_timeout))
+        if effective_timeout is not None
+        else 2
+    )
+    deadline = (
+        time.monotonic() + float(effective_timeout)
+        if effective_timeout is not None
+        else None
+    )
     ids = count(1)
-    with websocket_connect(websocket_url, open_timeout=2) as ws:
+    with websocket_connect(
+        websocket_url,
+        open_timeout=open_timeout,
+        close_timeout=close_timeout,
+    ) as ws:
         message_id = next(ids)
         ws.send(json.dumps({"id": message_id, "method": method, "params": params}))
         while True:
-            message = json.loads(ws.recv())
+            recv_timeout = None
+            if deadline is not None:
+                recv_timeout = deadline - time.monotonic()
+                if recv_timeout <= 0:
+                    raise TimeoutError(f"CDP call {method} timed out")
+            message = json.loads(ws.recv(timeout=recv_timeout))
             if message.get("id") == message_id:
                 if "error" in message:
                     raise RuntimeError(json.dumps(message["error"], ensure_ascii=False))
